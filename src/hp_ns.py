@@ -80,9 +80,13 @@ def main() -> None:
 
     # Nightshade bars
     n_thresholds = [cfg.nightshade_hp_threshold, cfg.nightshade_mp_threshold]
-    n_actions = [lambda r: on_low_nightshade_hp(r, cfg), on_low_nightshade_mp]
     n_ratios = [0.0, 0.0]
     n_last_alerts = [0.0, 0.0]
+    # Nightshade HP healing threshold is now editable via settings
+    n_hp_heal_threshold = cfg.nightshade_hp_heal_threshold
+    n_hp_heal_cd = 0.0
+    n_last_hp_heal = 0.0
+    n_actions = [lambda r: on_low_nightshade_hp(r, cfg), on_low_nightshade_mp]
 
     # Falka HP heal (press4 when HP < 70%)
     f_hp_heal_threshold = 0.70
@@ -235,6 +239,11 @@ def main() -> None:
                         alert_beep()
                         n_actions[i](n_ratios[i])
                         n_last_alerts[i] = now
+                # Nightshade HP heal (press1) when HP < threshold
+                if n_ratios[0] < n_hp_heal_threshold and (now - n_last_hp_heal) >= n_hp_heal_cd:
+                    print(f"\n[NIGHTSHADE] HP {n_ratios[0]:.0%} < {n_hp_heal_threshold:.0%} — press1")
+                    send_pico_command(cfg, "press1")
+                    n_last_hp_heal, n_hp_heal_cd = now, random.uniform(0.5, 1.0)
 
             # ---- Status line ----
             cp_r, hp_r, mp_r = f_ratios

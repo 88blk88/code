@@ -42,6 +42,7 @@ class MonitorConfig:
 
     nightshade_hp_threshold: float = 0.80
     nightshade_mp_threshold: float = 0.30
+    nightshade_hp_heal_threshold: float = 0.70
 
     # Enemy widget (HP%/MP%)
     enemy_left: int = 100

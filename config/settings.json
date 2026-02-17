@@ -12,6 +12,7 @@
   "nightshade_height": 53,
   "nightshade_hp_threshold": 0.8,
   "nightshade_mp_threshold": 0.3,
+  "nightshade_hp_heal_threshold": 0.7,
   "enemy_left": 1164,
   "enemy_top": 3,
   "enemy_width": 234,
