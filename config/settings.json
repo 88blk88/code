@@ -1,0 +1,23 @@
+{
+  "widget_left": 9,
+  "widget_top": 1,
+  "widget_width": 176,
+  "widget_height": 74,
+  "cp_threshold": 0.95,
+  "hp_threshold": 0.7,
+  "mp_threshold": 0.3,
+  "nightshade_left": 1484,
+  "nightshade_top": 3,
+  "nightshade_width": 175,
+  "nightshade_height": 53,
+  "nightshade_hp_threshold": 0.8,
+  "nightshade_mp_threshold": 0.3,
+  "enemy_left": 1164,
+  "enemy_top": 3,
+  "enemy_width": 234,
+  "enemy_height": 46,
+  "serial_port": "COM4",
+  "serial_baud": 115200,
+  "alert_cooldown_sec": 2.0,
+  "poll_interval_sec": 0.1
+}
