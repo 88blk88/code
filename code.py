@@ -39,6 +39,12 @@ while True:
             elif cmd == "press4":
                 kbd.send(Keycode.FOUR)
                 print("Pressed 4")
+            elif cmd == "press7":
+                kbd.send(Keycode.SEVEN)
+                print("Pressed 7")
+            elif cmd == "press8":
+                kbd.send(Keycode.EIGHT)
+                print("Pressed 8")
             # ignore unknown commands
         else:
             buf += ch
