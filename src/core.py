@@ -316,7 +316,7 @@ def detect_target_type(bgr_widget: np.ndarray) -> str:
         return "unknown"
     blue_ratio = cv2.countNonZero(cv2.inRange(hsv, (100, 60, 50), (130, 255, 255))) / total
     gold_ratio = cv2.countNonZero(cv2.inRange(hsv, (15, 80, 80), (40, 255, 255))) / total
-    min_r = 0.02
+    min_r = 0.05  # Increased threshold for gold ratio
     if blue_ratio >= min_r and blue_ratio > gold_ratio:
         return "enemy"
     if gold_ratio >= min_r and gold_ratio > blue_ratio:
