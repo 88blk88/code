@@ -23,28 +23,34 @@ while True:
                 if now - last_press1 >= press1_cooldown:
                     kbd.send(Keycode.ONE)
                     last_press1 = now
-                    press1_cooldown = 2.5 + random.uniform(-0.5, 0.5)
+                    press1_cooldown = random.uniform(0.5, 1.0)
                     print(f"Pressed 1 (cd {press1_cooldown:.2f}s)")
                 else:
                     print("press1 on cooldown")
             elif cmd == "presstab":
                 kbd.send(Keycode.TAB)
                 print("Pressed TAB")
-            elif cmd == "pressa":
-                kbd.send(Keycode.A)
-                print("Pressed A")
+            elif cmd == "press6":
+                kbd.send(Keycode.SIX)
+                print("Pressed 6")
             elif cmd == "presss":
                 kbd.send(Keycode.S)
                 print("Pressed S")
             elif cmd == "press4":
                 kbd.send(Keycode.FOUR)
                 print("Pressed 4")
+            elif cmd == "press5":
+                kbd.send(Keycode.FIVE)
+                print("Pressed 5")
             elif cmd == "press7":
                 kbd.send(Keycode.SEVEN)
                 print("Pressed 7")
             elif cmd == "press8":
                 kbd.send(Keycode.EIGHT)
                 print("Pressed 8")
+            elif cmd == "press9":
+                kbd.send(Keycode.NINE)
+                print("Pressed 9")
             # ignore unknown commands
         else:
             buf += ch

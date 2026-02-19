@@ -7,6 +7,8 @@ import time
 import random
 import argparse
 
+import keyboard
+
 import cv2
 import mss
 import numpy as np
@@ -17,8 +19,16 @@ from core import (
     on_low_nightshade_hp, on_low_nightshade_mp,
     on_enemy_alive,
     get_ocr_engine, ocr_full_widget, ocr_nightshade_widget, ocr_enemy_widget,
-    detect_target_type, detect_enemy_dead,
+    enemy_bar_empty,
 )
+
+TAB_COOLDOWN_SEC = 1.5    # Minimum seconds between TAB presses
+
+last_tab_time = 0.0
+
+SKILL8_INTERVAL =  3 * 60 + 40  # 3 minutes 40 seconds
+SKILL7_INTERVAL =  9 * 60.0   # 9 minutes
+SKILL9_INTERVAL = 19 * 60.0   # 19 minutes
 
 
 # ---------------------------------------------------------------------------
@@ -44,9 +54,12 @@ def render_preview(
     ]
 
     spacer = np.full((h, 4, 3), 40, dtype=np.uint8)
-    n_resized = cv2.resize(n_widget, (n_widget.shape[1], h))
-    e_resized = cv2.resize(e_widget, (e_widget.shape[1], h))
-    combined = cv2.hconcat([preview, spacer, n_resized, spacer.copy(), e_resized])
+    parts = [preview]
+    if n_widget.shape[0] > 0 and n_widget.shape[1] > 0:
+        parts += [spacer, cv2.resize(n_widget, (n_widget.shape[1], h))]
+    if e_widget.shape[0] > 0 and e_widget.shape[1] > 0:
+        parts += [spacer.copy(), cv2.resize(e_widget, (e_widget.shape[1], h))]
+    combined = cv2.hconcat(parts)
 
     pad_h = len(labels) * 16 + 8
     padded = cv2.copyMakeBorder(combined, 0, pad_h, 0, 0, cv2.BORDER_CONSTANT, value=(30, 30, 30))
@@ -66,41 +79,54 @@ def render_preview(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Falka + Nightshade + Enemy monitor.")
     parser.add_argument("--no-preview", action="store_true", help="Disable preview window.")
+    parser.add_argument("--spoil", action="store_true", help="Press 7 (Spoil) immediately after enemy dies, before TAB.")
     args = parser.parse_args()
 
     cfg = load_config()
     if args.no_preview:
         cfg.show_preview = False
+    spoil_mode: bool = args.spoil
 
     # Falka bars
     f_thresholds = [cfg.cp_threshold, cfg.hp_threshold, cfg.mp_threshold]
     f_actions = [on_low_cp, on_low_hp, on_low_mp]
-    f_ratios = [0.0, 0.0, 0.0]
+    f_ratios = [1.0, 1.0, 1.0]
     f_last_alerts = [0.0, 0.0, 0.0]
 
     # Nightshade bars
     n_thresholds = [cfg.nightshade_hp_threshold, cfg.nightshade_mp_threshold]
-    n_ratios = [0.0, 0.0]
+    n_ratios = [1.0, 1.0]
     n_last_alerts = [0.0, 0.0]
     # Nightshade HP healing threshold is now editable via settings
     n_hp_heal_threshold = cfg.nightshade_hp_heal_threshold
     n_hp_heal_cd = 0.0
     n_last_hp_heal = 0.0
     n_actions = [lambda r: on_low_nightshade_hp(r, cfg), on_low_nightshade_mp]
+    ns_present: bool = True      # updated by periodic presence check
+    last_ns_check: float = 0.0
+    NS_PRESENCE_CHECK_SEC = 10.0
 
-    # Falka HP heal (press4 when HP < 70%)
-    f_hp_heal_threshold = 0.70
-    f_hp_heal_cd = 0.0
-    f_last_hp_heal = 0.0
+    # Scheduled skill presses
+    last_press8 = 0.0
+    last_press7 = 0.0
+    last_press9 = 0.0
+
+    # Enemy OCR cache (updated every 3rd frame; has_enemy always from pixel check)
+    last_hp_str: str | None = None
+    empty_frames: int = 0          # consecutive frames with bar empty
+    EMPTY_FRAMES_REQUIRED = 2      # must be empty this many frames before switching
 
     # Enemy state machine
     SEARCHING, ATTACKING, IDLE = "searching", "attacking", "idle"
     e_state = SEARCHING
     e_hp: float = -1.0
     e_tab_attempts = 0
-    e_max_tabs = 8
+    e_max_tabs = 2
     e_last_attack = 0.0
     e_attack_cd = 0.0
+
+    e_idle_since = 0.0
+    IDLE_RESUME_SEC = 3.0
 
     if get_ocr_engine() is None:
         print("[ERROR] Install: pip install rapidocr-onnxruntime")
@@ -108,6 +134,7 @@ def main() -> None:
 
     frame = 0
 
+    global last_tab_time
     with mss.mss() as sct:
         f_mon = {"left": cfg.widget_left, "top": cfg.widget_top,
                  "width": cfg.widget_width, "height": cfg.widget_height}
@@ -116,7 +143,17 @@ def main() -> None:
         e_mon = {"left": cfg.enemy_left, "top": cfg.enemy_top,
                  "width": cfg.enemy_width, "height": cfg.enemy_height}
 
-        print("Monitor started (Falka + Nightshade + Enemy). Press Ctrl+C or Esc to stop.")
+        n_shot = np.zeros((max(1, cfg.nightshade_height), max(1, cfg.nightshade_width), 3), dtype=np.uint8)
+
+        bot_paused = [False]
+
+        def toggle_pause():
+            bot_paused[0] = not bot_paused[0]
+            print(f"\n[BOT] {'PAUSED' if bot_paused[0] else 'RESUMED'} (F4)")
+
+        keyboard.add_hotkey('f4', toggle_pause)
+        print("Monitor started (Falka + Nightshade + Enemy). Press F4 to pause/resume. Press Ctrl+C or Esc to stop.")
+
         while True:
             e_shot = np.array(sct.grab(e_mon))[:, :, :3]
 
@@ -130,79 +167,122 @@ def main() -> None:
             # Grab Falka / Nightshade only when needed (OCR frame or preview)
             if do_falka_ocr or cfg.show_preview:
                 f_shot = np.array(sct.grab(f_mon))[:, :, :3]
-            if do_night_ocr or cfg.show_preview:
+            if (do_night_ocr or cfg.show_preview) and cfg.nightshade_width > 0:
                 n_shot = np.array(sct.grab(n_mon))[:, :, :3]
 
-            # ---- Fast pixel checks (every frame) ----
+            if bot_paused[0]:
+                if cfg.show_preview:
+                    render_preview(f_shot, n_shot, e_shot, f_ratios[0], f_ratios[1], f_ratios[2], n_ratios[0], n_ratios[1], e_hp)
+                    if cv2.waitKey(1) & 0xFF == 27:
+                        break
+                time.sleep(0.05)
+                continue
+
+            # ---- Scheduled skill presses (highest priority) ----
+            now = time.time()
+            if now - last_press9 >= SKILL9_INTERVAL:
+                print(f"\n[SKILL] press9 (19min)")
+                send_pico_command(cfg, "press9")
+                last_press9 = now
+            if now - last_press7 >= SKILL7_INTERVAL:
+                print(f"\n[SKILL] press7 (9min)")
+                send_pico_command(cfg, "press7")
+                last_press7 = now
+            if now - last_press8 >= SKILL8_INTERVAL:
+                print(f"\n[SKILL] press8 (3.4s)")
+                send_pico_command(cfg, "press8")
+                last_press8 = now
+
             now = time.time()
             if e_state == ATTACKING:
-                if detect_enemy_dead(e_shot):
-                    print(f"\n[ENEMY] Pixel: dead — TAB")
-                    send_pico_command(cfg, "presstab")
-                    e_state, e_tab_attempts, e_hp = SEARCHING, 0, -1.0
-                elif detect_target_type(e_shot) == "player":
-                    print(f"\n[ENEMY] Pixel: PLAYER — S + TAB")
-                    send_pico_command(cfg, "presss")
-                    send_pico_command(cfg, "presstab")
-                    e_state, e_tab_attempts, e_hp = SEARCHING, 0, -1.0
-                elif (now - e_last_attack) >= e_attack_cd:
+                if (now - e_last_attack) >= e_attack_cd:
                     print(f"\n[ENEMY] Re-A ({e_hp:.0%})")
-                    send_pico_command(cfg, "pressa")
-                    e_last_attack, e_attack_cd = now, random.uniform(0.2, 0.7)
+                    send_pico_command(cfg, "press6")
+                    e_last_attack, e_attack_cd = now, random.uniform(2.0, 3.0)
 
-            # ---- Enemy OCR ----
-            run_e_ocr = (e_state == ATTACKING and frame % 5 == 0) or \
-                        (e_state in (SEARCHING, IDLE) and do_enemy_ocr)
+            # ---- Enemy detection ----
+            # has_enemy: always from pixel check (reliable, every frame)
+            # hp_str: from OCR every 3rd frame, cached otherwise
+            has_enemy = not enemy_bar_empty(e_shot)
+            if not has_enemy:
+                hp_str = None
+                last_hp_str = None
+            elif do_enemy_ocr:
+                _, _, hp_str = ocr_enemy_widget(e_shot)
+                last_hp_str = hp_str
+            else:
+                hp_str = last_hp_str
+            now = time.time()
 
-            if run_e_ocr:
-                has_enemy, hp_val = ocr_enemy_widget(e_shot)
-                now = time.time()
+            # Parse hp_str -> float for combat logic (more reliable: requires % sign)
+            hp_str_val: float | None = None
+            if hp_str is not None:
+                try:
+                    hp_str_val = float(hp_str.strip().replace('%', '').replace(' ', '')) / 100.0
+                except ValueError:
+                    print(f"[ENEMY PARSE] hp_str={hp_str!r} -> ValueError, hp_str_val remains None")
 
-                if e_state == SEARCHING:
-                    if has_enemy and hp_val is not None and hp_val > 0.01:
-                        tgt = detect_target_type(e_shot)
-                        if tgt == "player":
-                            print(f"\n[ENEMY] PLAYER — S + TAB")
-                            send_pico_command(cfg, "presss")
-                            send_pico_command(cfg, "presstab")
-                            e_hp = -1.0
-                        else:
-                            e_hp, e_state, e_tab_attempts = hp_val, ATTACKING, 0
-                            on_enemy_alive(e_hp, cfg)
-                            e_last_attack, e_attack_cd = now, random.uniform(0.2, 0.7)
-                    else:
+            # Update e_hp from hp_str (primary source)
+            prev_e_hp = e_hp
+            if hp_str_val is not None:
+                e_hp = hp_str_val
+
+            print(f"[ENEMY] state={e_state} | has_enemy={has_enemy} hp_str={hp_str!r} hp_str_val={f'{hp_str_val:.0%}' if hp_str_val is not None else None} e_hp={f'{e_hp:.0%}' if e_hp >= 0 else '--'}")
+
+            if e_state == SEARCHING:
+                if has_enemy and hp_str_val is not None and hp_str_val > 0.01:
+                    print(f"\n[STATE] SEARCHING -> ATTACKING (hp_str_val={hp_str_val:.0%})")
+                    e_state, e_tab_attempts = ATTACKING, 0
+
+                    last_tab_time = now
+                    on_enemy_alive(e_hp, cfg)
+                    e_last_attack, e_attack_cd = now, random.uniform(2.0, 3.0)
+                else:
+                    if now - last_tab_time >= TAB_COOLDOWN_SEC:
                         e_tab_attempts += 1
                         if e_tab_attempts > e_max_tabs:
-                            print(f"\n[ENEMY] {e_max_tabs} TABs failed — idle")
+                            print(f"\n[STATE] SEARCHING -> IDLE ({e_max_tabs} TABs failed)")
                             alert_beep()
                             e_state = IDLE
+                            e_idle_since = now
                         else:
                             print(f"\n[ENEMY] TAB ({e_tab_attempts}/{e_max_tabs})")
                             send_pico_command(cfg, "presstab")
+                            last_tab_time = now
 
-                elif e_state == ATTACKING:
-                    if has_enemy and hp_val is not None:
-                        if hp_val <= 0.01:
-                            print(f"\n[ENEMY] Dead — TAB")
-                            send_pico_command(cfg, "presstab")
-                            e_state, e_tab_attempts, e_hp = SEARCHING, 0, -1.0
-                        else:
-                            e_hp = hp_val
-                    else:
-                        e_state, e_tab_attempts, e_hp = SEARCHING, 0, -1.0
+            elif e_state == ATTACKING:
+                if not has_enemy:
+                    print(f"\n[STATE] ATTACKING -> SEARCHING (pixel bar empty)")
+                    if spoil_mode:
+                        print(f"[SPOIL] press5")
+                        send_pico_command(cfg, "press5")
+                    tab_delay = random.uniform(0.3, 0.6)
+                    last_tab_time = now - TAB_COOLDOWN_SEC + tab_delay
+                    print(f"[TAB] scheduled in {tab_delay:.2f}s")
+                    e_state, e_tab_attempts, e_hp = SEARCHING, 0, -1.0
+                elif has_enemy and hp_str_val is not None and prev_e_hp >= 0 and hp_str_val > prev_e_hp + 0.20:
+                    print(f"\n[ENEMY] Target change detected ({prev_e_hp:.0%} -> {hp_str_val:.0%}) — re-engaging")
+                    on_enemy_alive(e_hp, cfg)
 
-                elif e_state == IDLE:
-                    if has_enemy and hp_val is not None and hp_val > 0.01:
-                        tgt = detect_target_type(e_shot)
-                        if tgt == "player":
-                            print(f"\n[ENEMY] PLAYER (idle) — S + TAB")
-                            send_pico_command(cfg, "presss")
-                            send_pico_command(cfg, "presstab")
-                            e_hp = -1.0
-                        else:
-                            e_hp, e_state, e_tab_attempts = hp_val, ATTACKING, 0
-                            on_enemy_alive(e_hp, cfg)
-                            e_last_attack, e_attack_cd = now, random.uniform(0.2, 0.7)
+                    e_last_attack, e_attack_cd = now, 0.0
+
+            elif e_state == IDLE:
+                if has_enemy and hp_str_val is not None and hp_str_val > 0.01:
+                    print(f"\n[STATE] IDLE -> ATTACKING (hp_str_val={hp_str_val:.0%})")
+                    e_state, e_tab_attempts = ATTACKING, 0
+
+                    last_tab_time = now
+                    on_enemy_alive(e_hp, cfg)
+                    e_last_attack, e_attack_cd = now, random.uniform(2.0, 3.0)
+                elif has_enemy and hp_str_val is not None and hp_str_val <= 0.01:
+                    print(f"\n[STATE] IDLE -> SEARCHING (dead enemy at hp_str_val={hp_str_val:.0%}) — TAB to resume")
+                    if now - last_tab_time >= TAB_COOLDOWN_SEC:
+                        send_pico_command(cfg, "presstab")
+                        last_tab_time = now
+                    e_state, e_tab_attempts, e_hp = SEARCHING, 0, -1.0
+                elif now - e_idle_since >= IDLE_RESUME_SEC:
+                    print(f"\n[STATE] IDLE -> SEARCHING (timeout {IDLE_RESUME_SEC}s — resuming search)")
+                    e_state, e_tab_attempts, e_hp = SEARCHING, 0, -1.0
 
             # ---- Falka OCR ----
             if do_falka_ocr:
@@ -216,12 +296,6 @@ def main() -> None:
                         f_actions[i](f_ratios[i])
                         f_last_alerts[i] = now
 
-                # Heal press4 when Falka HP < 70%
-                if f_ratios[1] < f_hp_heal_threshold and (now - f_last_hp_heal) >= f_hp_heal_cd:
-                    print(f"\n[FALKA] HP {f_ratios[1]:.0%} < 70% \u2014 press4")
-                    send_pico_command(cfg, "press4")
-                    f_last_hp_heal, f_hp_heal_cd = now, random.uniform(0.5, 1.0)
-
                 # Stop if Falka HP hits 0
                 if f_ratios[1] <= 0.0:
                     print(f"\n[FALKA] HP is 0% \u2014 stopping script.")
@@ -231,19 +305,27 @@ def main() -> None:
             # ---- Nightshade OCR ----
             if do_night_ocr:
                 n_ocr = ocr_nightshade_widget(n_shot)
-                for i in range(min(len(n_ocr), 2)):
-                    n_ratios[i] = n_ocr[i]
                 now = time.time()
-                for i in range(2):
-                    if n_ratios[i] < n_thresholds[i] and (now - n_last_alerts[i]) >= cfg.alert_cooldown_sec:
-                        alert_beep()
-                        n_actions[i](n_ratios[i])
-                        n_last_alerts[i] = now
-                # Nightshade HP heal (press1) when HP < threshold
-                if n_ratios[0] < n_hp_heal_threshold and (now - n_last_hp_heal) >= n_hp_heal_cd:
-                    print(f"\n[NIGHTSHADE] HP {n_ratios[0]:.0%} < {n_hp_heal_threshold:.0%} — press1")
-                    send_pico_command(cfg, "press1")
-                    n_last_hp_heal, n_hp_heal_cd = now, random.uniform(0.5, 1.0)
+                # Periodic presence check every NS_PRESENCE_CHECK_SEC
+                if now - last_ns_check >= NS_PRESENCE_CHECK_SEC:
+                    last_ns_check = now
+                    new_present = len(n_ocr) >= 2
+                    if new_present != ns_present:
+                        ns_present = new_present
+                        print(f"\n[NIGHTSHADE] Widget {'detected' if ns_present else 'not found'} — reactions {'enabled' if ns_present else 'disabled'}")
+                if ns_present:
+                    for i in range(min(len(n_ocr), 2)):
+                        n_ratios[i] = n_ocr[i]
+                    for i in range(2):
+                        if n_ratios[i] < n_thresholds[i] and (now - n_last_alerts[i]) >= cfg.alert_cooldown_sec:
+                            alert_beep()
+                            n_actions[i](n_ratios[i])
+                            n_last_alerts[i] = now
+                    # Nightshade HP heal (press1) when HP < threshold
+                    if n_ratios[0] < n_hp_heal_threshold and (now - n_last_hp_heal) >= n_hp_heal_cd:
+                        print(f"\n[NIGHTSHADE] HP {n_ratios[0]:.0%} < {n_hp_heal_threshold:.0%} — press1")
+                        send_pico_command(cfg, "press1")
+                        n_last_hp_heal, n_hp_heal_cd = now, random.uniform(0.5, 1.0)
 
             # ---- Status line ----
             cp_r, hp_r, mp_r = f_ratios

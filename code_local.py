@@ -30,9 +30,9 @@ while True:
             elif cmd == "presstab":
                 kbd.send(Keycode.TAB)
                 print("Pressed TAB")
-            elif cmd == "pressa":
-                kbd.send(Keycode.A)
-                print("Pressed A")
+            elif cmd == "press6":
+                kbd.send(Keycode.SIX)
+                print("Pressed 6")
             elif cmd == "presss":
                 kbd.send(Keycode.S)
                 print("Pressed S")
