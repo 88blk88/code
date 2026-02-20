@@ -23,6 +23,9 @@ from core import (
 )
 
 TAB_COOLDOWN_SEC = 1.5    # Minimum seconds between TAB presses
+ATTACK_CD_MIN = 3.0       # Attack cooldown range (seconds)
+ATTACK_CD_MAX = 4.0
+STUCK_ATTACKS_REQUIRED = 3  # Consecutive attacks with no HP change before declaring stuck
 
 last_tab_time = 0.0
 
@@ -124,6 +127,9 @@ def main() -> None:
     e_max_tabs = 2
     e_last_attack = 0.0
     e_attack_cd = 0.0
+    e_stuck_attacks = 0
+    e_hp_at_attack: float = -1.0   # e_hp recorded at last press6
+    e_last_saw_enemy: float = 0.0  # last time has_enemy was True
 
     e_idle_since = 0.0
     IDLE_RESUME_SEC = 3.0
@@ -158,11 +164,9 @@ def main() -> None:
             e_shot = np.array(sct.grab(e_mon))[:, :, :3]
 
             frame += 1
-            # 3-phase stagger: 1 OCR call per frame max
-            phase = frame % 3
-            do_enemy_ocr = (phase == 0)
-            do_falka_ocr = (phase == 1)
-            do_night_ocr = (phase == 2)
+            do_enemy_ocr = (frame % 2 == 0)
+            do_falka_ocr = (frame % 6 == 1)
+            do_night_ocr = (frame % 6 == 4)
 
             # Grab Falka / Nightshade only when needed (OCR frame or preview)
             if do_falka_ocr or cfg.show_preview:
@@ -196,22 +200,50 @@ def main() -> None:
             now = time.time()
             if e_state == ATTACKING:
                 if (now - e_last_attack) >= e_attack_cd:
-                    print(f"\n[ENEMY] Re-A ({e_hp:.0%})")
-                    send_pico_command(cfg, "press6")
-                    e_last_attack, e_attack_cd = now, random.uniform(2.0, 3.0)
+                    # Stuck detection: HP unchanged across consecutive attacks
+                    if e_hp_at_attack >= 0 and e_hp >= 0 and abs(e_hp - e_hp_at_attack) < 0.02:
+                        e_stuck_attacks += 1
+                        print(f"[STUCK] HP unchanged at {e_hp:.0%} (x{e_stuck_attacks}/{STUCK_ATTACKS_REQUIRED})")
+                    else:
+                        e_stuck_attacks = 0
+                    if e_hp >= 0:
+                        e_hp_at_attack = e_hp
+
+                    if e_stuck_attacks >= STUCK_ATTACKS_REQUIRED:
+                        print(f"\n[STUCK] Enemy unreachable — TAB to switch target")
+                        send_pico_command(cfg, "presstab")
+                        last_tab_time = now
+                        e_state, e_tab_attempts, e_hp, empty_frames = SEARCHING, 0, -1.0, 0
+                        e_last_attack, e_attack_cd = now, random.uniform(ATTACK_CD_MIN, ATTACK_CD_MAX)
+                        e_stuck_attacks, e_hp_at_attack = 0, -1.0
+                    else:
+                        print(f"\n[ENEMY] Re-A ({e_hp:.0%})")
+                        send_pico_command(cfg, "press6")
+                        e_last_attack, e_attack_cd = now, random.uniform(ATTACK_CD_MIN, ATTACK_CD_MAX)
 
             # ---- Enemy detection ----
-            # has_enemy: always from pixel check (reliable, every frame)
-            # hp_str: from OCR every 3rd frame, cached otherwise
+            # Primary: pixel check every frame. At low HP the bar is thin and can
+            # look empty even while the enemy is alive; OCR is used to override.
             has_enemy = not enemy_bar_empty(e_shot)
-            if not has_enemy:
+            if has_enemy:
+                e_last_saw_enemy = now
+                if do_enemy_ocr:
+                    _, _, hp_str = ocr_enemy_widget(e_shot)
+                    last_hp_str = hp_str
+                else:
+                    hp_str = last_hp_str
+            else:
                 hp_str = None
                 last_hp_str = None
-            elif do_enemy_ocr:
-                _, _, hp_str = ocr_enemy_widget(e_shot)
-                last_hp_str = hp_str
-            else:
-                hp_str = last_hp_str
+                # At low HP pixel bar can look empty while enemy is still alive.
+                # Run OCR on this frame to verify; if it reads HP > 0, override pixel.
+                if e_state == ATTACKING and 0.0 <= e_hp < 0.15 and do_enemy_ocr:
+                    _, ocr_hp, ocr_hp_str = ocr_enemy_widget(e_shot)
+                    if ocr_hp is not None and ocr_hp > 0.01:
+                        print(f"[PIXEL OVERRIDE] pixel=dead but OCR={ocr_hp:.0%} — treating as alive")
+                        has_enemy = True
+                        hp_str = ocr_hp_str
+                        e_last_saw_enemy = now
             now = time.time()
 
             # Parse hp_str -> float for combat logic (more reliable: requires % sign)
@@ -230,13 +262,19 @@ def main() -> None:
             print(f"[ENEMY] state={e_state} | has_enemy={has_enemy} hp_str={hp_str!r} hp_str_val={f'{hp_str_val:.0%}' if hp_str_val is not None else None} e_hp={f'{e_hp:.0%}' if e_hp >= 0 else '--'}")
 
             if e_state == SEARCHING:
-                if has_enemy and hp_str_val is not None and hp_str_val > 0.01:
-                    print(f"\n[STATE] SEARCHING -> ATTACKING (hp_str_val={hp_str_val:.0%})")
-                    e_state, e_tab_attempts = ATTACKING, 0
+                if has_enemy:
+                    # If enemy bar is present, do not press TAB, even if OCR fails
+                    if hp_str_val is not None and hp_str_val > 0.01:
+                        print(f"\n[STATE] SEARCHING -> ATTACKING (hp_str_val={hp_str_val:.0%})")
+                        e_state, e_tab_attempts = ATTACKING, 0
 
-                    last_tab_time = now
-                    on_enemy_alive(e_hp, cfg)
-                    e_last_attack, e_attack_cd = now, random.uniform(2.0, 3.0)
+                        last_tab_time = now
+                        if e_last_attack == 0.0:
+                            # No TAB was pressed; fire initial attack now
+                            on_enemy_alive(e_hp, cfg)
+                            e_last_attack, e_attack_cd = now, random.uniform(ATTACK_CD_MIN, ATTACK_CD_MAX)
+                        # else: TAB already set the cooldown; periodic ATTACKING block handles next press6
+                    # else: remain in SEARCHING, but do not press TAB
                 else:
                     if now - last_tab_time >= TAB_COOLDOWN_SEC:
                         e_tab_attempts += 1
@@ -249,22 +287,32 @@ def main() -> None:
                             print(f"\n[ENEMY] TAB ({e_tab_attempts}/{e_max_tabs})")
                             send_pico_command(cfg, "presstab")
                             last_tab_time = now
+                            e_last_attack, e_attack_cd = now, random.uniform(ATTACK_CD_MIN, ATTACK_CD_MAX)
 
             elif e_state == ATTACKING:
                 if not has_enemy:
-                    print(f"\n[STATE] ATTACKING -> SEARCHING (pixel bar empty)")
+                    empty_frames += 1
+                else:
+                    empty_frames = 0
+                # At very low HP the pixel bar looks empty due to thin bar width;
+                # require the bar to be gone for 1.5s (not just a few frames) before declaring dead
+                low_hp_wait = (0.0 <= e_hp < 0.15) and (now - e_last_saw_enemy) < 1.5
+                if not has_enemy and empty_frames >= EMPTY_FRAMES_REQUIRED and not low_hp_wait:
+                    print(f"\n[STATE] ATTACKING -> SEARCHING (pixel bar empty x{empty_frames}, last_saw={now - e_last_saw_enemy:.1f}s ago)")
                     if spoil_mode:
                         print(f"[SPOIL] press5")
                         send_pico_command(cfg, "press5")
-                    tab_delay = random.uniform(0.3, 0.6)
-                    last_tab_time = now - TAB_COOLDOWN_SEC + tab_delay
-                    print(f"[TAB] scheduled in {tab_delay:.2f}s")
-                    e_state, e_tab_attempts, e_hp = SEARCHING, 0, -1.0
+                        spoil_delay = random.uniform(0.4, 0.6)
+                        last_tab_time = now - TAB_COOLDOWN_SEC + spoil_delay
+                        print(f"[SPOIL] TAB delayed {spoil_delay:.2f}s")
+                    else:
+                        last_tab_time = now - TAB_COOLDOWN_SEC
+                    e_state, e_tab_attempts, e_hp, empty_frames = SEARCHING, 0, -1.0, 0
+                    e_last_attack, e_stuck_attacks, e_hp_at_attack, e_last_saw_enemy = 0.0, 0, -1.0, 0.0
                 elif has_enemy and hp_str_val is not None and prev_e_hp >= 0 and hp_str_val > prev_e_hp + 0.20:
                     print(f"\n[ENEMY] Target change detected ({prev_e_hp:.0%} -> {hp_str_val:.0%}) — re-engaging")
                     on_enemy_alive(e_hp, cfg)
-
-                    e_last_attack, e_attack_cd = now, 0.0
+                    e_last_attack, e_attack_cd = now, random.uniform(ATTACK_CD_MIN, ATTACK_CD_MAX)
 
             elif e_state == IDLE:
                 if has_enemy and hp_str_val is not None and hp_str_val > 0.01:
@@ -272,8 +320,9 @@ def main() -> None:
                     e_state, e_tab_attempts = ATTACKING, 0
 
                     last_tab_time = now
-                    on_enemy_alive(e_hp, cfg)
-                    e_last_attack, e_attack_cd = now, random.uniform(2.0, 3.0)
+                    if e_last_attack == 0.0:
+                        on_enemy_alive(e_hp, cfg)
+                        e_last_attack, e_attack_cd = now, random.uniform(ATTACK_CD_MIN, ATTACK_CD_MAX)
                 elif has_enemy and hp_str_val is not None and hp_str_val <= 0.01:
                     print(f"\n[STATE] IDLE -> SEARCHING (dead enemy at hp_str_val={hp_str_val:.0%}) — TAB to resume")
                     if now - last_tab_time >= TAB_COOLDOWN_SEC:

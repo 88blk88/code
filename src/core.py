@@ -4,7 +4,6 @@ import re
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple
 
 import cv2
 import numpy as np
@@ -63,7 +62,10 @@ def load_config() -> MonitorConfig:
     if not config_path.exists():
         return MonitorConfig()
     data = json.loads(config_path.read_text(encoding="utf-8"))
-    return MonitorConfig(**data)
+    # Only keep keys that are fields of MonitorConfig
+    valid_keys = set(MonitorConfig.__dataclass_fields__)
+    filtered_data = {k: v for k, v in data.items() if k in valid_keys}
+    return MonitorConfig(**filtered_data)
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +170,6 @@ def get_ocr_engine():
 # ---------------------------------------------------------------------------
 
 
-
 def _extract_slash_pairs(text: str) -> list[float]:
     candidates = re.findall(r"(\d{2,6})\s*/\s*(\d{2,6})", text)
     ratios = []
@@ -184,10 +185,7 @@ def _extract_slash_pairs(text: str) -> list[float]:
 
 
 def parse_all_ratios_from_text(text: str, expected: int = 3) -> list[float]:
-    ratios = _extract_slash_pairs(text)
-    if len(ratios) >= expected:
-        return ratios
-    return ratios
+    return _extract_slash_pairs(text)
 
 
 def _extract_percentages(text: str) -> list[float]:
@@ -279,13 +277,12 @@ def ocr_nightshade_widget(bgr_widget: np.ndarray) -> list[float]:
 
 _PREPROCESS_VARIANT_NAMES = ["normalized", "binary", "binary_inv", "clahe"]
 
-def ocr_enemy_widget(bgr_widget: np.ndarray) -> Tuple[bool, float | None, str | None]:
+def ocr_enemy_widget(bgr_widget: np.ndarray) -> tuple[bool, float | None, str | None]:
     """OCR enemy widget -> (has_enemy, hp_ratio)."""
     engine = get_ocr_engine()
     if engine is None:
         return (False, None, None)
-    for idx, image in enumerate(_preprocess(bgr_widget)):
-        variant = _PREPROCESS_VARIANT_NAMES[idx] if idx < len(_PREPROCESS_VARIANT_NAMES) else str(idx)
+    for variant, image in zip(_PREPROCESS_VARIANT_NAMES, _preprocess(bgr_widget)):
         try:
             result, _ = engine(image)
         except Exception as exc:
@@ -308,7 +305,9 @@ def ocr_enemy_widget(bgr_widget: np.ndarray) -> Tuple[bool, float | None, str | 
     return (False, None, None)
 
 
-def enemy_bar_empty(bgr_widget: np.ndarray, red_threshold: int = 45) -> bool:
+_ENEMY_BAR_THRESHOLDS = None
+
+def enemy_bar_empty(bgr_widget: np.ndarray) -> bool:
     """Fast pixel check: is the enemy HP bar empty (no red bar visible)?
 
     Samples the leftmost 20% of the widget width, trimming 2px border,
@@ -316,10 +315,26 @@ def enemy_bar_empty(bgr_widget: np.ndarray, red_threshold: int = 45) -> bool:
     Returns True when the bar is absent (enemy dead / no target).
     Actual widget size from settings: 157x13 px.
     """
-    h, w = bgr_widget.shape[:2]
-    x_end = max(4, int(w * 0.03))   # ~5px: red at any HP >1%, dark only when no target
-    strip = bgr_widget[2:h-2, 2:x_end]
-    mean_red = float(strip[:, :, 2].mean())   # BGR: channel 2 = red
-    print(f"[PIXEL] enemy bar mean_red={mean_red:.1f} (threshold={red_threshold}, cols=2:{x_end})")
-    return mean_red < red_threshold
+    global _ENEMY_BAR_THRESHOLDS
+    if _ENEMY_BAR_THRESHOLDS is None:
+        try:
+            config_path = Path(r"c:\code\config\settings.json")
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+            full_red = float(data.get("enemy_bar_full_red", 120))
+            empty_red = float(data.get("enemy_bar_empty_red", 40))
+            full_rg_ratio = float(data.get("enemy_bar_full_rg_ratio", 2.5))
+            _ENEMY_BAR_THRESHOLDS = (full_red, empty_red, full_rg_ratio)
+        except Exception as e:
+            print(f"[PIXEL] Failed to load color thresholds from settings.json: {e}")
+            _ENEMY_BAR_THRESHOLDS = (120, 40, 2.5)
+    full_red, empty_red, full_rg_ratio = _ENEMY_BAR_THRESHOLDS
+    h = bgr_widget.shape[0]
+    x_end = 5
+    strip = bgr_widget[2:h-2, 2:2 + x_end].astype(np.float32)
+    mean_red = float(strip[:, :, 2].mean())
+    mean_green = float(strip[:, :, 1].mean())
+    mean_blue = float(strip[:, :, 0].mean())
+    rg_ratio = mean_red / mean_green if mean_green > 0 else 0.0
+    print(f"[PIXEL] enemy bar mean_red={mean_red:.1f} rg_ratio={rg_ratio:.2f} (need red>={full_red:.1f} rg>={full_rg_ratio:.2f} red>blue)")
+    return mean_red < full_red or rg_ratio < 1.5 or mean_red <= mean_blue
 
