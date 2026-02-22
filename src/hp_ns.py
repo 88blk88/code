@@ -22,6 +22,8 @@ from core import (
     enemy_bar_empty,
 )
 
+from ocr_thread import EventWatcher
+
 TAB_COOLDOWN_SEC = 1.5    # Minimum seconds between TAB presses
 ATTACK_CD_MIN = 3.0       # Attack cooldown range (seconds)
 ATTACK_CD_MAX = 4.0
@@ -29,9 +31,6 @@ STUCK_ATTACKS_REQUIRED = 3  # Consecutive attacks with no HP change before decla
 
 last_tab_time = 0.0
 
-SKILL8_INTERVAL =  3 * 60 + 40  # 3 minutes 40 seconds
-SKILL7_INTERVAL =  9 * 60.0   # 9 minutes
-SKILL9_INTERVAL = 19 * 60.0   # 19 minutes
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +89,12 @@ def main() -> None:
         cfg.show_preview = False
     spoil_mode: bool = args.spoil
 
+    # --- Event Watcher: monitors centre screen for popup keywords, auto-pauses bot ---
+    _event_watcher = EventWatcher(interval=1.0)
+    _event_watcher.start()
+    last_event_check = 0.0
+    EVENT_CHECK_SEC = 3.0
+
     # Falka bars
     f_thresholds = [cfg.cp_threshold, cfg.hp_threshold, cfg.mp_threshold]
     f_actions = [on_low_cp, on_low_hp, on_low_mp]
@@ -111,8 +116,8 @@ def main() -> None:
 
     # Scheduled skill presses
     last_press8 = 0.0
-    last_press7 = 0.0
     last_press9 = 0.0
+    last_press10 = 0.0
 
     # Enemy OCR cache (updated every 3rd frame; has_enemy always from pixel check)
     last_hp_str: str | None = None
@@ -174,6 +179,15 @@ def main() -> None:
             if (do_night_ocr or cfg.show_preview) and cfg.nightshade_width > 0:
                 n_shot = np.array(sct.grab(n_mon))[:, :, :3]
 
+            # --- Event Watcher check ---
+            if time.time() - last_event_check >= EVENT_CHECK_SEC:
+                last_event_check = time.time()
+                if _event_watcher.is_event_found():
+                    if not bot_paused[0]:
+                        bot_paused[0] = True
+                        print("\n[EVENT] Popup detected — bot paused. Press F4 to resume.")
+                    _event_watcher.clear_event()
+
             if bot_paused[0]:
                 if cfg.show_preview:
                     render_preview(f_shot, n_shot, e_shot, f_ratios[0], f_ratios[1], f_ratios[2], n_ratios[0], n_ratios[1], e_hp)
@@ -184,19 +198,21 @@ def main() -> None:
 
             # ---- Scheduled skill presses (highest priority) ----
             now = time.time()
-            if now - last_press9 >= SKILL9_INTERVAL:
-                print(f"\n[SKILL] press9 (19min)")
-                send_pico_command(cfg, "press9")
+            if now - last_press10 >= cfg.buff3_interval_sec:
+                print(f"\n[BUFF3] {cfg.key_buff3} ({cfg.buff3_interval_sec:.0f}s)")
+                send_pico_command(cfg, cfg.key_buff3)
+                last_press10 = now
+            if now - last_press9 >= cfg.buff2_interval_sec:
+                print(f"\n[BUFF2] {cfg.key_buff2} ({cfg.buff2_interval_sec:.0f}s)")
+                send_pico_command(cfg, cfg.key_buff2)
                 last_press9 = now
-            if now - last_press7 >= SKILL7_INTERVAL:
-                print(f"\n[SKILL] press7 (9min)")
-                send_pico_command(cfg, "press7")
-                last_press7 = now
-            if now - last_press8 >= SKILL8_INTERVAL:
-                print(f"\n[SKILL] press8 (3.4s)")
-                send_pico_command(cfg, "press8")
+            if now - last_press8 >= cfg.buff1_interval_sec:
+                print(f"\n[BUFF1] {cfg.key_buff1} ({cfg.buff1_interval_sec:.0f}s)")
+                send_pico_command(cfg, cfg.key_buff1)
                 last_press8 = now
 
+            if bot_paused[0]:
+                continue
             now = time.time()
             if e_state == ATTACKING:
                 if (now - e_last_attack) >= e_attack_cd:
@@ -210,15 +226,15 @@ def main() -> None:
                         e_hp_at_attack = e_hp
 
                     if e_stuck_attacks >= STUCK_ATTACKS_REQUIRED:
-                        print(f"\n[STUCK] Enemy unreachable — TAB to switch target")
-                        send_pico_command(cfg, "presstab")
+                        print(f"\n[STUCK] Enemy unreachable — {cfg.key_target_switch} to switch target")
+                        send_pico_command(cfg, cfg.key_target_switch)
                         last_tab_time = now
                         e_state, e_tab_attempts, e_hp, empty_frames = SEARCHING, 0, -1.0, 0
                         e_last_attack, e_attack_cd = now, random.uniform(ATTACK_CD_MIN, ATTACK_CD_MAX)
                         e_stuck_attacks, e_hp_at_attack = 0, -1.0
                     else:
                         print(f"\n[ENEMY] Re-A ({e_hp:.0%})")
-                        send_pico_command(cfg, "press6")
+                        send_pico_command(cfg, cfg.key_attack)
                         e_last_attack, e_attack_cd = now, random.uniform(ATTACK_CD_MIN, ATTACK_CD_MAX)
 
             # ---- Enemy detection ----
@@ -261,6 +277,8 @@ def main() -> None:
 
             print(f"[ENEMY] state={e_state} | has_enemy={has_enemy} hp_str={hp_str!r} hp_str_val={f'{hp_str_val:.0%}' if hp_str_val is not None else None} e_hp={f'{e_hp:.0%}' if e_hp >= 0 else '--'}")
 
+            if bot_paused[0]:
+                continue
             if e_state == SEARCHING:
                 if has_enemy:
                     # If enemy bar is present, do not press TAB, even if OCR fails
@@ -281,11 +299,13 @@ def main() -> None:
                         if e_tab_attempts > e_max_tabs:
                             print(f"\n[STATE] SEARCHING -> IDLE ({e_max_tabs} TABs failed)")
                             alert_beep()
+                            send_pico_command(cfg, cfg.key_target_switch)
+                            last_tab_time = now
                             e_state = IDLE
                             e_idle_since = now
                         else:
                             print(f"\n[ENEMY] TAB ({e_tab_attempts}/{e_max_tabs})")
-                            send_pico_command(cfg, "presstab")
+                            send_pico_command(cfg, cfg.key_tab)
                             last_tab_time = now
                             e_last_attack, e_attack_cd = now, random.uniform(ATTACK_CD_MIN, ATTACK_CD_MAX)
 
@@ -300,8 +320,8 @@ def main() -> None:
                 if not has_enemy and empty_frames >= EMPTY_FRAMES_REQUIRED and not low_hp_wait:
                     print(f"\n[STATE] ATTACKING -> SEARCHING (pixel bar empty x{empty_frames}, last_saw={now - e_last_saw_enemy:.1f}s ago)")
                     if spoil_mode:
-                        print(f"[SPOIL] press5")
-                        send_pico_command(cfg, "press5")
+                        print(f"[SPOIL] {cfg.key_spoil}")
+                        send_pico_command(cfg, cfg.key_spoil)
                         spoil_delay = random.uniform(0.4, 0.6)
                         last_tab_time = now - TAB_COOLDOWN_SEC + spoil_delay
                         print(f"[SPOIL] TAB delayed {spoil_delay:.2f}s")
@@ -324,13 +344,15 @@ def main() -> None:
                         on_enemy_alive(e_hp, cfg)
                         e_last_attack, e_attack_cd = now, random.uniform(ATTACK_CD_MIN, ATTACK_CD_MAX)
                 elif has_enemy and hp_str_val is not None and hp_str_val <= 0.01:
-                    print(f"\n[STATE] IDLE -> SEARCHING (dead enemy at hp_str_val={hp_str_val:.0%}) — TAB to resume")
+                    print(f"\n[STATE] IDLE -> SEARCHING (dead enemy at hp_str_val={hp_str_val:.0%}) — {cfg.key_target_switch} to resume")
                     if now - last_tab_time >= TAB_COOLDOWN_SEC:
-                        send_pico_command(cfg, "presstab")
+                        send_pico_command(cfg, cfg.key_target_switch)
                         last_tab_time = now
                     e_state, e_tab_attempts, e_hp = SEARCHING, 0, -1.0
                 elif now - e_idle_since >= IDLE_RESUME_SEC:
                     print(f"\n[STATE] IDLE -> SEARCHING (timeout {IDLE_RESUME_SEC}s — resuming search)")
+                    send_pico_command(cfg, cfg.key_target_switch)
+                    last_tab_time = now
                     e_state, e_tab_attempts, e_hp = SEARCHING, 0, -1.0
 
             # ---- Falka OCR ----
@@ -338,6 +360,8 @@ def main() -> None:
                 f_ocr = ocr_full_widget(f_shot)
                 for i in range(min(len(f_ocr), 3)):
                     f_ratios[i] = f_ocr[i]
+                if bot_paused[0]:
+                    continue
                 now = time.time()
                 for i in range(3):
                     if f_ratios[i] < f_thresholds[i] and (now - f_last_alerts[i]) >= cfg.alert_cooldown_sec:
@@ -362,6 +386,8 @@ def main() -> None:
                     if new_present != ns_present:
                         ns_present = new_present
                         print(f"\n[NIGHTSHADE] Widget {'detected' if ns_present else 'not found'} — reactions {'enabled' if ns_present else 'disabled'}")
+                if bot_paused[0]:
+                    continue
                 if ns_present:
                     for i in range(min(len(n_ocr), 2)):
                         n_ratios[i] = n_ocr[i]
@@ -372,8 +398,8 @@ def main() -> None:
                             n_last_alerts[i] = now
                     # Nightshade HP heal (press1) when HP < threshold
                     if n_ratios[0] < n_hp_heal_threshold and (now - n_last_hp_heal) >= n_hp_heal_cd:
-                        print(f"\n[NIGHTSHADE] HP {n_ratios[0]:.0%} < {n_hp_heal_threshold:.0%} — press1")
-                        send_pico_command(cfg, "press1")
+                        print(f"\n[NIGHTSHADE] HP {n_ratios[0]:.0%} < {n_hp_heal_threshold:.0%} — {cfg.key_heal_ns}")
+                        send_pico_command(cfg, cfg.key_heal_ns)
                         n_last_hp_heal, n_hp_heal_cd = now, random.uniform(0.5, 1.0)
 
             # ---- Status line ----
@@ -382,10 +408,13 @@ def main() -> None:
             e_str = f"{e_hp:.0%}" if e_hp >= 0 else "--"
             print(f"\rFalka CP:{cp_r:.0%} HP:{hp_r:.0%} MP:{mp_r:.0%}  Night HP:{nhp_r:.0%} MP:{nmp_r:.0%}  Enemy HP:{e_str}   ", end="")
 
+
             if cfg.show_preview:
                 render_preview(f_shot, n_shot, e_shot, cp_r, hp_r, mp_r, nhp_r, nmp_r, e_hp)
                 if cv2.waitKey(1) & 0xFF == 27:
                     break
+
+    _event_watcher.stop()
 
     if cfg.show_preview:
         cv2.destroyAllWindows()

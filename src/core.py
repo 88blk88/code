@@ -56,6 +56,21 @@ class MonitorConfig:
     poll_interval_sec: float = 0.10
     show_preview: bool = True
 
+    # Key bindings (Pico command strings)
+    key_tab: str = "presstab"            # target switch in SEARCHING
+    key_target_switch: str = "pressbacktick"  # target switch in IDLE / stuck
+    key_attack: str = "press6"           # basic attack
+    key_heal_ns: str = "press1"          # Nightshade HP heal
+    key_spoil: str = "press5"            # Spoil (--spoil mode)
+    key_buff1: str = "press8"            # scheduled buff 1
+    key_buff2: str = "press9"            # scheduled buff 2
+    key_buff3: str = "press10"           # scheduled buff 3
+
+    # Buff intervals (seconds)
+    buff1_interval_sec: float = 3 * 60 + 40   # 3m40s
+    buff2_interval_sec: float = 9 * 60.0       # 9min
+    buff3_interval_sec: float = 19 * 60.0      # 19min
+
 
 def load_config() -> MonitorConfig:
     config_path = Path(r"c:\code\config\settings.json")
@@ -133,8 +148,8 @@ def on_low_mp(mp_ratio: float) -> None:
 def on_low_nightshade_hp(hp_ratio: float, cfg: MonitorConfig | None = None) -> None:
     print(f"\n[ACTION] Nightshade low HP at {hp_ratio:.1%} -> pressing 1 via Pico")
     if cfg is not None:
-        print(f"[ACTION] About to send 'press1' to Pico for Nightshade low HP.")
-        send_pico_command(cfg, "press1")
+        print(f"[ACTION] About to send '{cfg.key_heal_ns}' to Pico for Nightshade low HP.")
+        send_pico_command(cfg, cfg.key_heal_ns)
 
 
 def on_low_nightshade_mp(mp_ratio: float) -> None:
@@ -144,8 +159,8 @@ def on_low_nightshade_mp(mp_ratio: float) -> None:
 def on_enemy_alive(hp_pct: float, cfg: MonitorConfig | None = None) -> None:
     print(f"\n[ACTION] Enemy alive at {hp_pct:.0%} -> pressing A to attack")
     if cfg is not None:
-        print(f"[ACTION] About to send 'press6' to Pico for enemy alive.")
-        send_pico_command(cfg, "press6")
+        print(f"[ACTION] About to send '{cfg.key_attack}' to Pico for enemy alive.")
+        send_pico_command(cfg, cfg.key_attack)
 
 
 # ---------------------------------------------------------------------------
