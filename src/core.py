@@ -22,7 +22,7 @@ except ImportError:
 
 @dataclass
 class MonitorConfig:
-    # Falka widget (CP/HP/MP)
+    # Player widget (CP/HP/MP)
     widget_left: int = 55
     widget_top: int = 23
     widget_width: int = 98
@@ -32,16 +32,16 @@ class MonitorConfig:
     hp_threshold: float = 0.70
     mp_threshold: float = 0.30
 
-    # Nightshade widget (HP/MP)
-    nightshade_enabled: bool = True
-    nightshade_left: int = 1518
-    nightshade_top: int = 26
-    nightshade_width: int = 72
-    nightshade_height: int = 25
+    # Pet widget (HP/MP)
+    pet_enabled: bool = True
+    pet_left: int = 1518
+    pet_top: int = 26
+    pet_width: int = 72
+    pet_height: int = 25
 
-    nightshade_hp_threshold: float = 0.80
-    nightshade_mp_threshold: float = 0.30
-    nightshade_hp_heal_threshold: float = 0.70
+    pet_hp_threshold: float = 0.80
+    pet_mp_threshold: float = 0.30
+    pet_hp_heal_threshold: float = 0.70
 
     # Enemy widget (HP%)
     enemy_left: int = 1229
@@ -60,8 +60,8 @@ class MonitorConfig:
     key_tab: str = "presstab"            # target switch in SEARCHING
     key_target_switch: str = "pressbacktick"  # target switch in IDLE / stuck
     key_attack: str = "press6"           # basic attack
-    key_heal_ns: str = "press1"          # Nightshade HP heal
-    key_spoil: str = "press5"            # Spoil (--spoil mode)
+    key_heal_pet: str = "press1"          # Pet HP heal
+    key_pick_up: str = "press5"          # Pick Up (--pick-up mode)
     key_buff1: str = "press8"            # scheduled buff 1
     key_buff2: str = "press9"            # scheduled buff 2
     key_buff3: str = "press10"           # scheduled buff 3
@@ -145,15 +145,15 @@ def on_low_mp(mp_ratio: float) -> None:
     print(f"\n[ACTION] Low MP action triggered at {mp_ratio:.1%}")
 
 
-def on_low_nightshade_hp(hp_ratio: float, cfg: MonitorConfig | None = None) -> None:
-    print(f"\n[ACTION] Nightshade low HP at {hp_ratio:.1%} -> pressing 1 via Pico")
+def on_low_pet_hp(hp_ratio: float, cfg: MonitorConfig | None = None) -> None:
+    print(f"\n[ACTION] Pet low HP at {hp_ratio:.1%} -> pressing 1 via Pico")
     if cfg is not None:
-        print(f"[ACTION] About to send '{cfg.key_heal_ns}' to Pico for Nightshade low HP.")
-        send_pico_command(cfg, cfg.key_heal_ns)
+        print(f"[ACTION] About to send '{cfg.key_heal_pet}' to Pico for Pet low HP.")
+        send_pico_command(cfg, cfg.key_heal_pet)
 
 
-def on_low_nightshade_mp(mp_ratio: float) -> None:
-    print(f"\n[ACTION] Nightshade low MP at {mp_ratio:.1%}")
+def on_low_pet_mp(mp_ratio: float) -> None:
+    print(f"\n[ACTION] Pet low MP at {mp_ratio:.1%}")
 
 
 def on_enemy_alive(hp_pct: float, cfg: MonitorConfig | None = None) -> None:
@@ -204,6 +204,9 @@ def parse_all_ratios_from_text(text: str, expected: int = 3) -> list[float]:
 
 
 def _extract_percentages(text: str) -> list[float]:
+    # Collapse OCR-inserted spaces within numbers: "1 00. 00%" -> "100.00%"
+    text = re.sub(r'(\d)\s+(\d)', r'\1\2', text)
+    text = re.sub(r'(\d)\s*\.\s*(\d)', r'\1.\2', text)
     matches = re.findall(r"(\d{1,3}(?:\.\d+)?)\s*%", text)
     ratios = []
     for m in matches:
@@ -245,7 +248,7 @@ def _preprocess(bgr_widget: np.ndarray) -> list[np.ndarray]:
 # ---------------------------------------------------------------------------
 
 def ocr_full_widget(bgr_widget: np.ndarray) -> list[float]:
-    """OCR Falka's widget -> [CP, HP, MP] ratios."""
+    """OCR Player's widget -> [CP, HP, MP] ratios."""
     global _ocr_warning_printed
     engine = get_ocr_engine()
     if engine is None:
@@ -261,16 +264,16 @@ def ocr_full_widget(bgr_widget: np.ndarray) -> list[float]:
         if not result:
             continue
         combined = " ".join(e[1] for e in result if len(e) >= 2)
-        print(f"[OCR DEBUG] Falka raw OCR text: {combined}")
+        print(f"[OCR DEBUG] Player raw OCR text: {combined}")
         ratios = parse_all_ratios_from_text(combined)
-        print(f"[OCR DEBUG] Falka parsed ratios: {ratios}")
+        print(f"[OCR DEBUG] Player parsed ratios: {ratios}")
         if len(ratios) >= 3:
             return ratios[:3]
     return []
 
 
-def ocr_nightshade_widget(bgr_widget: np.ndarray) -> list[float]:
-    """OCR Nightshade's widget -> [HP, MP] ratios."""
+def ocr_pet_widget(bgr_widget: np.ndarray) -> list[float]:
+    """OCR Pet's widget -> [HP, MP] ratios."""
     engine = get_ocr_engine()
     if engine is None:
         return []
@@ -282,9 +285,9 @@ def ocr_nightshade_widget(bgr_widget: np.ndarray) -> list[float]:
         if not result:
             continue
         combined = " ".join(e[1] for e in result if len(e) >= 2)
-        print(f"[OCR DEBUG] Nightshade raw OCR text: {combined}")
+        print(f"[OCR DEBUG] Pet raw OCR text: {combined}")
         ratios = parse_all_ratios_from_text(combined, expected=2)
-        print(f"[OCR DEBUG] Nightshade parsed ratios: {ratios}")
+        print(f"[OCR DEBUG] Pet parsed ratios: {ratios}")
         if len(ratios) >= 2:
             return ratios[:2]
     return []
@@ -321,6 +324,28 @@ def ocr_enemy_widget(bgr_widget: np.ndarray) -> tuple[bool, float | None, str | 
 
 
 _ENEMY_BAR_THRESHOLDS = None
+
+def enemy_widget_is_player(bgr_widget: np.ndarray) -> bool:
+    """Pixel check: does the enemy widget show the player's own CP bar (golden/amber)?
+
+    Samples the same 5-pixel wide strip as enemy_bar_empty.
+    Player bar BGR signature from player_bar_color.png: B≈46, G≈99, R≈130
+      → R/G ≈ 1.3  (much lower than enemy red ~2.5)
+      → G/B ≈ 2.15 (green well above blue — golden hue)
+    Returns True when the bar matches player colour.
+    """
+    h = bgr_widget.shape[0]
+    x_end = 5
+    strip = bgr_widget[2:h-2, 2:2 + x_end].astype(np.float32)
+    mean_r = float(strip[:, :, 2].mean())
+    mean_g = float(strip[:, :, 1].mean())
+    mean_b = float(strip[:, :, 0].mean())
+    rg_ratio = mean_r / mean_g if mean_g > 0 else 0.0
+    gb_ratio = mean_g / mean_b if mean_b > 0 else 0.0
+    is_player = mean_r >= 90 and rg_ratio < 2.0 and gb_ratio >= 1.5 and mean_r > mean_b
+    print(f"[PIXEL] player-bar check R={mean_r:.1f} G={mean_g:.1f} B={mean_b:.1f} R/G={rg_ratio:.2f} G/B={gb_ratio:.2f} -> {'PLAYER' if is_player else 'not-player'}")
+    return is_player
+
 
 def enemy_bar_empty(bgr_widget: np.ndarray) -> bool:
     """Fast pixel check: is the enemy HP bar empty (no red bar visible)?
