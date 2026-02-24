@@ -1,7 +1,9 @@
 """Background OCR — monitors the centre of the screen for event popup keywords."""
 
 import threading
+import time
 import winsound
+from dataclasses import dataclass, field
 
 import cv2
 
@@ -13,7 +15,25 @@ try:
 except ImportError:
     RapidOCR = None
 
-from core import _preprocess
+from core import (
+    _preprocess,
+    ocr_full_widget, ocr_pet_widget, ocr_enemy_widget,
+    MonitorConfig,
+)
+
+
+# ---------------------------------------------------------------------------
+# Shared state for WidgetOCRWorker
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _WidgetOCRState:
+    player_ratios: list[float] = field(default_factory=lambda: [1.0, 1.0, 1.0])
+    pet_ratios:    list[float] = field(default_factory=lambda: [1.0, 1.0])
+    enemy_has:    bool           = False
+    enemy_hp:     float | None   = None
+    enemy_hp_str: str | None     = None
+    enemy_ts:     float          = 0.0   # timestamp of last successful enemy OCR
 
 
 # ---------------------------------------------------------------------------
@@ -195,3 +215,115 @@ class EventWatcher:
             if pattern.lower() in lower:
                 return pattern
         return None
+
+
+# ---------------------------------------------------------------------------
+# WidgetOCRWorker
+# ---------------------------------------------------------------------------
+
+class WidgetOCRWorker:
+    """Background daemon: grabs widget screenshots and runs OCR continuously.
+    Main loop reads cached results via get_player(), get_pet(), get_enemy().
+    Owns its own mss context — no screenshots are passed from the main loop.
+    """
+
+    def __init__(self, cfg: MonitorConfig,
+                 player_interval: float = 0.60,
+                 pet_interval:    float = 0.60,
+                 enemy_interval:  float = 0.20):
+        self._cfg = cfg
+        self._pi, self._peti, self._ei = player_interval, pet_interval, enemy_interval
+        self._state = _WidgetOCRState()
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="WidgetOCRWorker")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        self._thread.start()
+        print("[WidgetOCRWorker] Started.")
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5.0)
+        print("[WidgetOCRWorker] Stopped.")
+
+    def get_player(self) -> list[float]:
+        with self._lock:
+            return list(self._state.player_ratios)
+
+    def get_pet(self) -> list[float]:
+        with self._lock:
+            return list(self._state.pet_ratios)
+
+    def get_enemy(self) -> tuple[bool, float | None, str | None]:
+        with self._lock:
+            return self._state.enemy_has, self._state.enemy_hp, self._state.enemy_hp_str
+
+    def get_enemy_ts(self) -> float:
+        with self._lock:
+            return self._state.enemy_ts
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _run(self) -> None:
+        cfg = self._cfg
+        p_mon  = {"left": cfg.widget_left, "top": cfg.widget_top,
+                  "width": cfg.widget_width, "height": cfg.widget_height}
+        pt_mon = {"left": cfg.pet_left,    "top": cfg.pet_top,
+                  "width": cfg.pet_width,   "height": cfg.pet_height}
+        e_mon  = {"left": cfg.enemy_left,  "top": cfg.enemy_top,
+                  "width": cfg.enemy_width, "height": cfg.enemy_height}
+
+        now = time.time()
+        next_p, next_pt, next_e = now, now + 0.30, now   # stagger player vs pet by 0.3s
+
+        with mss.mss() as sct:
+            while not self._stop.is_set():
+                now = time.time()
+
+                if now >= next_e:
+                    next_e = now + self._ei
+                    try:
+                        shot = np.array(sct.grab(e_mon))[:, :, :3]
+                        has_e, hp, hp_str = ocr_enemy_widget(shot)
+                        with self._lock:
+                            self._state.enemy_has    = has_e
+                            self._state.enemy_hp     = hp
+                            self._state.enemy_hp_str = hp_str
+                            if has_e and hp is not None:
+                                self._state.enemy_ts = now
+                    except Exception as exc:
+                        print(f"[WidgetOCRWorker] Enemy error: {exc}")
+
+                if now >= next_p:
+                    next_p = now + self._pi
+                    try:
+                        shot = np.array(sct.grab(p_mon))[:, :, :3]
+                        ratios = ocr_full_widget(shot)
+                        if len(ratios) >= 3:
+                            with self._lock:
+                                self._state.player_ratios = ratios[:3]
+                    except Exception as exc:
+                        print(f"[WidgetOCRWorker] Player error: {exc}")
+
+                if now >= next_pt and cfg.pet_enabled and cfg.pet_width > 0:
+                    next_pt = now + self._peti
+                    try:
+                        shot = np.array(sct.grab(pt_mon))[:, :, :3]
+                        ratios = ocr_pet_widget(shot)
+                        if len(ratios) >= 2:
+                            with self._lock:
+                                self._state.pet_ratios = ratios[:2]
+                    except Exception as exc:
+                        print(f"[WidgetOCRWorker] Pet error: {exc}")
+
+                sleep_for = max(0.0, min(next_e, next_p, next_pt) - time.time())
+                self._stop.wait(sleep_for)
+
+        print("[WidgetOCRWorker] Loop exited.")

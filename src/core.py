@@ -311,13 +311,19 @@ def ocr_enemy_widget(bgr_widget: np.ndarray) -> tuple[bool, float | None, str | 
             continue
         combined = " ".join(e[1] for e in result if len(e) >= 2)
         print(f"[OCR ENEMY] variant={variant} raw='{combined}'")
-        # Try to extract the first percentage string
-        pct_match = re.search(r"(\d{1,3}(?:\.\d+)?)\s*%", combined)
-        pct_str = pct_match.group(0) if pct_match else None
         pcts = _extract_percentages(combined)
-        print(f"[OCR ENEMY] variant={variant} pct_str={pct_str!r} hp_val={pcts[0] if pcts else None} all_pcts={pcts}")
         if pcts:
-            return (True, pcts[0], pct_str)
+            best = max(pcts)
+            best_match = None
+            for m in re.finditer(r"(\d{1,3}(?:\.\d+)?)\s*%", combined):
+                if abs(float(m.group(1)) / 100.0 - best) < 1e-6:
+                    best_match = m
+                    break
+            pct_str = best_match.group(0) if best_match else None
+            print(f"[OCR ENEMY] variant={variant} pct_str={pct_str!r} hp_val={best} all_pcts={pcts}")
+            return (True, best, pct_str)
+        pct_str = None
+        print(f"[OCR ENEMY] variant={variant} pct_str=None hp_val=None all_pcts={pcts}")
         print(f"[OCR ENEMY] variant={variant} -> text found but no percentage parsed, trying next variant")
     print(f"[OCR ENEMY] all variants exhausted -> no result")
     return (False, None, None)
