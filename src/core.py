@@ -1,14 +1,24 @@
 """Shared utilities for game stat monitors."""
 
 import re
+import sys
 import json
-from dataclasses import dataclass
+import time as _time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
 import numpy as np
-import serial
+import socket
 import winsound
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_CONFIG_PATH = _PROJECT_ROOT / "config" / "settings.json"
+
+try:
+    import serial as _serial_mod
+except ImportError:
+    _serial_mod = None
 
 try:
     from rapidocr_onnxruntime import RapidOCR
@@ -29,8 +39,11 @@ class MonitorConfig:
     widget_height: int = 38
 
     cp_threshold: float = 0.95
+    alert_cp_enabled: bool = True
     hp_threshold: float = 0.70
+    alert_hp_enabled: bool = True
     mp_threshold: float = 0.30
+    alert_mp_enabled: bool = True
 
     # Pet widget (HP/MP)
     pet_enabled: bool = True
@@ -40,8 +53,11 @@ class MonitorConfig:
     pet_height: int = 25
 
     pet_hp_threshold: float = 0.80
+    alert_pet_hp_enabled: bool = True
     pet_mp_threshold: float = 0.30
+    alert_pet_mp_enabled: bool = True
     pet_hp_heal_threshold: float = 0.70
+    alert_pet_hp_heal_enabled: bool = True
 
     # Enemy widget (HP%)
     enemy_left: int = 1229
@@ -49,6 +65,17 @@ class MonitorConfig:
     enemy_width: int = 59
     enemy_height: int = 25
 
+    game_window_title: str = ""           # title substring of game window — used for coordinate tracking
+    focus_window_titles: list = field(default_factory=list)  # auto-pause when none of these are focused (empty = disabled)
+    test_focus_switch: bool = False   # switch to test_target_window on each new enemy
+    test_target_window: str = ""      # window to switch to
+    focus_switch_delay_sec: float = 0.4   # seconds to wait after switching TO secondary window before sending key
+    focus_switch_stay_sec: float = 0.3   # seconds to keep secondary window focused after sending key
+    focus_switch_back_delay_sec: float = 0.1  # seconds to wait after switching BACK to game window
+
+    transport: str = "wifi"       # "wifi" or "serial"
+    pico_ip: str = "192.168.138.2"
+    pico_port: int = 9999
     serial_port: str = "COM4"
     serial_baud: int = 115200
 
@@ -57,45 +84,214 @@ class MonitorConfig:
     show_preview: bool = True
 
     # Key bindings (Pico command strings)
-    key_tab: str = "presstab"            # target switch in SEARCHING
-    key_target_switch: str = "pressbacktick"  # target switch in IDLE / stuck
+    key_next_target_near: str = "presstab"       # cycle to nearest target
+    add_shift_next_target_near: bool = False
+    add_hold_shift_next_target_near: bool = False  # hold shift+key instead of press
+    key_next_target_far: str = "pressbacktick"   # cycle to far/next target
+    add_shift_next_target_far: bool = False
+    add_hold_shift_next_target_far: bool = False   # hold shift+key instead of press
     key_attack: str = "press6"           # basic attack
+    key_attack_hold: bool = False        # hold attack key throughout ATTACKING instead of pressing each cycle
+    add_shift: bool = False              # press Shift together with attack key
+    add_hold_shift: bool = False         # hold Shift together with hold-attack key
+    key_attack_2nd: str = "press7"       # optional follow-up attack
+    key_attack_2nd_enabled: bool = False
+    key_attack_2nd_hold: bool = False    # hold secondary attack key throughout ATTACKING
+    attack_2nd_delay_min: float = 0.1    # seconds after first attack
+    attack_2nd_delay_max: float = 0.3
     key_heal_pet: str = "press1"          # Pet HP heal
+    add_shift_heal_pet: bool = False
     key_pick_up: str = "press5"          # Pick Up (--pick-up mode)
+    add_shift_pick_up: bool = False
     key_buff1: str = "press8"            # scheduled buff 1
+    add_shift_buff1: bool = False
     key_buff2: str = "press9"            # scheduled buff 2
+    add_shift_buff2: bool = False
     key_buff3: str = "press10"           # scheduled buff 3
+    add_shift_buff3: bool = False
 
-    # Buff intervals (seconds)
+    enemy_bar_full_red: float = 80.0          # minimum mean_red for enemy bar detection
+    enemy_bar_full_rg_ratio: float = 2.0      # minimum R/G ratio for enemy bar detection
+    calibration_scale: int = 8    # upscale factor for the calibrate_enemy_bar.py preview window
+
+    # Buff intervals and grace periods (seconds)
     buff1_interval_sec: float = 3 * 60 + 40   # 3m40s
+    buff1_grace_sec: float = 0.0              # suppress attacks after buff1 fires
     buff2_interval_sec: float = 9 * 60.0       # 9min
+    buff2_grace_sec: float = 0.0
     buff3_interval_sec: float = 19 * 60.0      # 19min
+    buff3_grace_sec: float = 0.0
+
+    # Periodic action in the secondary window (test_target_window)
+    key_buff_2nd_window: str = "press7"           # key to send in secondary window every buff_2nd_window_interval_sec
+    add_shift_buff_2nd_window: bool = False
+    buff_2nd_window_interval_sec: float = 180.0  # 3 minutes; 0 = disabled
+    buff_2nd_window_delay_sec: float = 0.9       # wait after switching to secondary before sending key
+    buff_2nd_window_stay_sec: float = 2.5        # how long to keep secondary focused after key
+
+    # Combat timing (moved from hp_ns.py constants)
+    tab_cooldown_sec: float = 1.5        # minimum seconds between TAB presses
+    max_no_enemy_cycles: int = 10        # SEARCHING->IDLE cycles before auto-pause
+    attack_cd_min: float = 3.0           # attack cooldown range (seconds)
+    attack_cd_max: float = 4.0
+    idle_resume_sec: float = 3.0         # seconds in IDLE before resuming SEARCHING
+
+    # Event popup detection patterns (case-insensitive substring match)
+    event_patterns: list = field(default_factory=lambda: [
+        "Hello Falka",
+        "To village",
+        "Your actions seem suspicious to us",
+        "To avoid disconnection",
+        "you need to",
+        "solve a simple arithmetic problem",
+        "Decision time",
+        "Attempt",
+        "Solve the task",
+        "Do you want to participate in",
+    ])
 
 
 def load_config() -> MonitorConfig:
-    config_path = Path(r"c:\code\config\settings.json")
-    if not config_path.exists():
+    if not _CONFIG_PATH.exists():
         return MonitorConfig()
-    data = json.loads(config_path.read_text(encoding="utf-8"))
-    # Only keep keys that are fields of MonitorConfig
+    data = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
     valid_keys = set(MonitorConfig.__dataclass_fields__)
+    unknown = [k for k in data if k not in valid_keys and not k.startswith("_")]
+    if unknown:
+        print(f"[CONFIG] Warning: unknown keys in settings.json (ignored): {unknown}")
     filtered_data = {k: v for k, v in data.items() if k in valid_keys}
     return MonitorConfig(**filtered_data)
 
 
 # ---------------------------------------------------------------------------
-# Serial
+# Window helpers  (shared by hp_ns.py, calibrate_enemy_bar.py, etc.)
 # ---------------------------------------------------------------------------
 
-_serial_conn: serial.Serial | None = None
+_dpi_aware = False
+
+def _ensure_dpi_aware() -> None:
+    """Call once: make the process DPI-aware so Win32 coords match mss physical pixels."""
+    global _dpi_aware
+    if _dpi_aware:
+        return
+    _dpi_aware = True
+    import ctypes
+    try:
+        # Windows 8.1+: per-monitor DPI awareness (most accurate)
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            # Windows Vista+: system DPI awareness (fallback)
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
 
 
-def get_serial(cfg: MonitorConfig) -> serial.Serial | None:
+def win_client_origin(substring: str) -> tuple[int, int] | None:
+    """Return screen (x, y) of the game window client area top-left, or None.
+
+    ClientToScreen(hwnd, 0,0) already accounts for title bar and window borders —
+    (0,0) in client coordinates is the first drawable pixel inside the frame.
+    _ensure_dpi_aware() is called first so the returned coordinates are in physical
+    pixels, matching what mss captures.
+    """
+    if sys.platform != "win32" or not substring:
+        return None
+    _ensure_dpi_aware()
+    import ctypes
+    import ctypes.wintypes as _wt
+    u32 = ctypes.windll.user32
+    found = [0]
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, _wt.HWND, _wt.LPARAM)
+    def _cb(hwnd, _):
+        if u32.IsWindowVisible(hwnd):
+            n = u32.GetWindowTextLengthW(hwnd)
+            if n:
+                buf = ctypes.create_unicode_buffer(n + 1)
+                u32.GetWindowTextW(hwnd, buf, n + 1)
+                if substring.lower() in buf.value.lower():
+                    found[0] = hwnd
+                    return False
+        return True
+
+    u32.EnumWindows(_cb, 0)
+    if not found[0]:
+        return None
+    pt = _wt.POINT(0, 0)
+    u32.ClientToScreen(found[0], ctypes.byref(pt))
+    return (pt.x, pt.y)
+
+
+def make_capture_regions(cfg: "MonitorConfig") -> tuple[dict, dict, dict]:
+    """Build (player_mon, pet_mon, enemy_mon) mss capture dicts with window origin offset.
+
+    Resolves the game window client origin the same way hp_ns.py does:
+      game_title = cfg.game_window_title  or  cfg.focus_window_titles[0]
+    Saves result to calling code via the returned dicts.
+    """
+    game_title = cfg.game_window_title or (
+        cfg.focus_window_titles[0] if cfg.focus_window_titles else ""
+    )
+    origin = win_client_origin(game_title) if game_title else None
+    if game_title and origin is None:
+        print(f"[WINDOW] WARNING: '{game_title}' not found — using (0,0), capture will be wrong")
+    ox, oy = origin if origin is not None else (0, 0)
+    return (
+        {"left": cfg.widget_left + ox, "top": cfg.widget_top + oy,
+         "width": cfg.widget_width,    "height": cfg.widget_height},
+        {"left": cfg.pet_left    + ox, "top": cfg.pet_top    + oy,
+         "width": cfg.pet_width,       "height": cfg.pet_height},
+        {"left": cfg.enemy_left  + ox, "top": cfg.enemy_top  + oy,
+         "width": cfg.enemy_width,     "height": cfg.enemy_height},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Transport (WiFi or Serial)
+# ---------------------------------------------------------------------------
+
+_wifi_sock: socket.socket | None = None
+_serial_conn = None
+_pico_lock = __import__("threading").Lock()  # one command at a time across all threads
+_pico_fail_until: float = 0.0   # backoff: skip sends until this timestamp
+_pico_fail_logged: float = 0.0  # last time we logged a backoff skip
+_PICO_BACKOFF_SEC = 5.0
+_PICO_BACKOFF_LOG_INTERVAL = 10.0
+
+_VALID_CMD_RE = re.compile(r"^(press|hold|release)(all|shift\+)?[a-z0-9+]*$")
+
+
+def _get_wifi(cfg: MonitorConfig) -> socket.socket | None:
+    global _wifi_sock
+    if _wifi_sock is not None:
+        return _wifi_sock
+    sock = None
+    try:
+        sock = socket.create_connection((cfg.pico_ip, cfg.pico_port), timeout=3.0)
+        sock.settimeout(1.0)
+        _wifi_sock = sock
+        print(f"[WIFI] Connected to {cfg.pico_ip}:{cfg.pico_port}")
+        return _wifi_sock
+    except Exception as e:
+        print(f"\n[WIFI] Cannot connect to {cfg.pico_ip}:{cfg.pico_port}: {e}")
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        return None
+
+
+def _get_serial(cfg: MonitorConfig):
     global _serial_conn
     if _serial_conn is not None and _serial_conn.is_open:
         return _serial_conn
+    if _serial_mod is None:
+        print("\n[SERIAL] pyserial not installed.")
+        return None
     try:
-        _serial_conn = serial.Serial(cfg.serial_port, cfg.serial_baud, timeout=0.1)
+        _serial_conn = _serial_mod.Serial(cfg.serial_port, cfg.serial_baud, timeout=0.1)
         print(f"[SERIAL] Connected to {cfg.serial_port}")
         return _serial_conn
     except Exception as e:
@@ -104,19 +300,55 @@ def get_serial(cfg: MonitorConfig) -> serial.Serial | None:
 
 
 def send_pico_command(cfg: MonitorConfig, cmd: str) -> None:
-    global _serial_conn
-    print(f"[ACTION] Sending Pico command: {cmd}")
-    conn = get_serial(cfg)
-    if conn is None:
-        print(f"[ACTION] Pico command '{cmd}' not sent: serial unavailable.")
+    global _wifi_sock, _serial_conn, _pico_fail_until, _pico_fail_logged
+
+    if not _VALID_CMD_RE.match(cmd):
+        print(f"[PICO] Warning: command '{cmd}' doesn't match expected format (press|hold|release...)")
+
+    now = _time.time()
+    if now < _pico_fail_until:
+        if now - _pico_fail_logged >= _PICO_BACKOFF_LOG_INTERVAL:
+            print(f"[PICO] Skipping commands — backoff active ({_pico_fail_until - now:.1f}s remaining)")
+            _pico_fail_logged = now
         return
-    try:
-        conn.write((cmd + "\r\n").encode())
-        conn.flush()
-        print(f"[ACTION] Pico command '{cmd}' sent.")
-    except Exception as e:
-        print(f"\n[SERIAL] Write error: {e}")
-        _serial_conn = None
+
+    print(f"[ACTION] Sending Pico command: {cmd}")
+    with _pico_lock:
+        if cfg.transport == "serial":
+            conn = _get_serial(cfg)
+            if conn is None:
+                _pico_fail_until = now + _PICO_BACKOFF_SEC
+                _pico_fail_logged = now
+                print(f"[ACTION] Pico command '{cmd}' not sent: serial unavailable. Backoff {_PICO_BACKOFF_SEC}s.")
+                return
+            try:
+                conn.write((cmd + "\r\n").encode())
+                conn.flush()
+                _pico_fail_until = 0.0
+            except Exception as e:
+                print(f"\n[SERIAL] Write error: {e}")
+                _serial_conn = None
+                _pico_fail_until = now + _PICO_BACKOFF_SEC
+                _pico_fail_logged = now
+        else:
+            conn = _get_wifi(cfg)
+            if conn is None:
+                _pico_fail_until = now + _PICO_BACKOFF_SEC
+                _pico_fail_logged = now
+                print(f"[ACTION] Pico command '{cmd}' not sent: WiFi unavailable. Backoff {_PICO_BACKOFF_SEC}s.")
+                return
+            try:
+                conn.sendall((cmd + "\r\n").encode())
+                _pico_fail_until = 0.0
+            except Exception as e:
+                print(f"\n[WIFI] Send error: {e}")
+                try:
+                    _wifi_sock.close()
+                except Exception:
+                    pass
+                _wifi_sock = None
+                _pico_fail_until = now + _PICO_BACKOFF_SEC
+                _pico_fail_logged = now
 
 
 # ---------------------------------------------------------------------------
@@ -124,9 +356,12 @@ def send_pico_command(cfg: MonitorConfig, cmd: str) -> None:
 # ---------------------------------------------------------------------------
 
 def alert_beep() -> None:
-    """Play a distinctive double beep alert."""
-    winsound.Beep(1200, 120)
-    winsound.Beep(1600, 120)
+    """Play a distinctive double beep alert (non-blocking)."""
+    import threading as _t
+    def _play():
+        winsound.Beep(1200, 120)
+        winsound.Beep(1600, 120)
+    _t.Thread(target=_play, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +421,9 @@ def get_ocr_engine():
 
 
 def _extract_slash_pairs(text: str) -> list[float]:
+    # Fix OCR misread: "6638/6638" → "663816638" (slash read as digit 1, no space)
+    # Pattern: same 3-5 digit number appearing twice with a "1" between them
+    text = re.sub(r'(\d{3,5})1(\1)', r'\1/\2', text)
     candidates = re.findall(r"(\d{2,6})\s*/\s*(\d{2,6})", text)
     ratios = []
     for current_str, maximum_str in candidates:
@@ -329,58 +567,55 @@ def ocr_enemy_widget(bgr_widget: np.ndarray) -> tuple[bool, float | None, str | 
     return (False, None, None)
 
 
-_ENEMY_BAR_THRESHOLDS = None
-
 def enemy_widget_is_player(bgr_widget: np.ndarray) -> bool:
     """Pixel check: does the enemy widget show the player's own CP bar (golden/amber)?
 
-    Samples the same 5-pixel wide strip as enemy_bar_empty.
-    Player bar BGR signature from player_bar_color.png: B≈46, G≈99, R≈130
-      → R/G ≈ 1.3  (much lower than enemy red ~2.5)
-      → G/B ≈ 2.15 (green well above blue — golden hue)
-    Returns True when the bar matches player colour.
+    Calibrated from player_bar_color.png: B=46.7 G=101.4 R=131.0
+      R/G ≈ 1.29  (enemy red bar R/G is ~2.5+, so this is distinctly lower)
+      G/B ≈ 2.17  (golden hue: green well above blue)
+    Intended to be called unconditionally every frame — only logs on detection.
+    Enemy bar fails this check because its R/G >> 2.0.
     """
-    h = bgr_widget.shape[0]
-    x_end = 5
-    strip = bgr_widget[2:h-2, 2:2 + x_end].astype(np.float32)
+    h, w = bgr_widget.shape[:2]
+    x_end = max(6, w // 10)       # left 10% of bar width
+    trim = max(2, h // 4)         # ~25% top/bottom trim against misalignment
+    strip = bgr_widget[trim:h-trim, 1:x_end].astype(np.float32)
     mean_r = float(strip[:, :, 2].mean())
     mean_g = float(strip[:, :, 1].mean())
     mean_b = float(strip[:, :, 0].mean())
     rg_ratio = mean_r / mean_g if mean_g > 0 else 0.0
     gb_ratio = mean_g / mean_b if mean_b > 0 else 0.0
-    is_player = mean_r >= 90 and rg_ratio < 2.0 and gb_ratio >= 1.5 and mean_r > mean_b
-    print(f"[PIXEL] player-bar check R={mean_r:.1f} G={mean_g:.1f} B={mean_b:.1f} R/G={rg_ratio:.2f} G/B={gb_ratio:.2f} -> {'PLAYER' if is_player else 'not-player'}")
+    is_player = (
+        90 <= mean_r < 180
+        and mean_b < 80
+        and 1.0 <= rg_ratio < 2.0
+        and gb_ratio >= 1.6
+    )
+    if is_player:
+        print(f"[PIXEL] PLAYER BAR detected: R={mean_r:.1f} G={mean_g:.1f} B={mean_b:.1f} R/G={rg_ratio:.2f} G/B={gb_ratio:.2f}")
     return is_player
 
 
-def enemy_bar_empty(bgr_widget: np.ndarray) -> bool:
+def enemy_bar_empty(bgr_widget: np.ndarray, cfg: MonitorConfig | None = None) -> tuple[bool, float]:
     """Fast pixel check: is the enemy HP bar empty (no red bar visible)?
 
-    Samples the leftmost 20% of the widget width, trimming 2px border,
-    and checks the mean red channel value.
-    Returns True when the bar is absent (enemy dead / no target).
-    Actual widget size from settings: 157x13 px.
+    Samples a 3×3 px patch centred at 75% of bar height (25% from bottom),
+    columns 2–4. Returns (is_empty, mean_red) where is_empty is True when the
+    bar is absent (enemy dead / no target) and mean_red is the raw red channel
+    mean for use in OCR cross-checks.
+    Thresholds come from cfg (MonitorConfig). Falls back to defaults if cfg is None.
     """
-    global _ENEMY_BAR_THRESHOLDS
-    if _ENEMY_BAR_THRESHOLDS is None:
-        try:
-            config_path = Path(r"c:\code\config\settings.json")
-            data = json.loads(config_path.read_text(encoding="utf-8"))
-            full_red = float(data.get("enemy_bar_full_red", 120))
-            empty_red = float(data.get("enemy_bar_empty_red", 40))
-            full_rg_ratio = float(data.get("enemy_bar_full_rg_ratio", 2.5))
-            _ENEMY_BAR_THRESHOLDS = (full_red, empty_red, full_rg_ratio)
-        except Exception as e:
-            print(f"[PIXEL] Failed to load color thresholds from settings.json: {e}")
-            _ENEMY_BAR_THRESHOLDS = (120, 40, 2.5)
-    full_red, empty_red, full_rg_ratio = _ENEMY_BAR_THRESHOLDS
+    full_red = cfg.enemy_bar_full_red if cfg else 80.0
+    full_rg_ratio = cfg.enemy_bar_full_rg_ratio if cfg else 2.0
     h = bgr_widget.shape[0]
-    x_end = 5
-    strip = bgr_widget[2:h-2, 2:2 + x_end].astype(np.float32)
+    x_end = 3
+    mid = h * 3 // 4  # 25% from bottom
+    strip = bgr_widget[mid-1:mid+2, 2:2 + x_end].astype(np.float32)
     mean_red = float(strip[:, :, 2].mean())
     mean_green = float(strip[:, :, 1].mean())
     mean_blue = float(strip[:, :, 0].mean())
     rg_ratio = mean_red / mean_green if mean_green > 0 else 0.0
     print(f"[PIXEL] enemy bar mean_red={mean_red:.1f} rg_ratio={rg_ratio:.2f} (need red>={full_red:.1f} rg>={full_rg_ratio:.2f} red>blue)")
-    return mean_red < full_red or rg_ratio < 1.5 or mean_red <= mean_blue
+    is_empty = mean_red < full_red or rg_ratio < full_rg_ratio or mean_red <= mean_blue
+    return is_empty, mean_red
 

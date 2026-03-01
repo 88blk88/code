@@ -1,27 +1,43 @@
-import time
+"""Pico 2 W USB-serial firmware — reads press<key> commands from USB CDC.
+
+Accepts the same command format as the WiFi version:
+  press<key>          e.g. presstab, press6, pressbacktick
+  press<mod>+<key>    e.g. pressctrl+c, pressalt+f4
+
+Setup:
+  1. Copy this file to the Pico's CIRCUITPY drive as code.py
+     (rename or remove the WiFi code.py first).
+  2. In config/settings.json set:
+       "transport": "serial"
+       "serial_port": "COMx"   (check Device Manager -> Ports for the right port)
+  3. Baud rate in settings ("serial_baud") is ignored by CircuitPython USB CDC,
+     but 115200 is fine as a placeholder.
+"""
+
 import sys
+import time
 import random
-import usb_hid
 import supervisor
+import usb_hid
 from adafruit_hid.keyboard import Keyboard
 from adafruit_hid.keycode import Keycode
 
+# ---------------------------------------------------------------------------
+# USB HID keyboard
+# ---------------------------------------------------------------------------
+
 kbd = Keyboard(usb_hid.devices)
-buf = ""
-last_press1 = 0
-press1_cooldown = 0
-print("CODE.PY LOADED")
+print("HID keyboard ready. Waiting for serial commands...")
 
 # ---------------------------------------------------------------------------
-# Key lookup tables
+# Key lookup tables (identical to WiFi code.py)
 # ---------------------------------------------------------------------------
 
 KEY_MAP = {
-    # Numbers (row)
+    # Numbers
     "0": Keycode.ZERO,  "1": Keycode.ONE,   "2": Keycode.TWO,
     "3": Keycode.THREE, "4": Keycode.FOUR,  "5": Keycode.FIVE,
     "6": Keycode.SIX,   "7": Keycode.SEVEN, "8": Keycode.EIGHT, "9": Keycode.NINE,
-    # Alias: "10" -> key 0  (skill slot 10 in games)
     "10": Keycode.ZERO,
     # Letters
     "a": Keycode.A, "b": Keycode.B, "c": Keycode.C, "d": Keycode.D,
@@ -60,19 +76,19 @@ KEY_MAP = {
     "capslock":   Keycode.CAPS_LOCK,
     "numlock":    Keycode.KEYPAD_NUMLOCK,
     "app":        Keycode.APPLICATION,
-    # Symbols (unshifted)
-    "backtick":   Keycode.GRAVE_ACCENT,   # `
+    # Symbols
+    "backtick":   Keycode.GRAVE_ACCENT,
     "grave":      Keycode.GRAVE_ACCENT,
-    "minus":      Keycode.MINUS,           # -
-    "equals":     Keycode.EQUALS,          # =
-    "lbracket":   Keycode.LEFT_BRACKET,    # [
-    "rbracket":   Keycode.RIGHT_BRACKET,   # ]
-    "backslash":  Keycode.BACKSLASH,       # \
-    "semicolon":  Keycode.SEMICOLON,       # ;
-    "quote":      Keycode.QUOTE,           # '
-    "comma":      Keycode.COMMA,           # ,
-    "period":     Keycode.PERIOD,          # .
-    "slash":      Keycode.FORWARD_SLASH,   # /
+    "minus":      Keycode.MINUS,
+    "equals":     Keycode.EQUALS,
+    "lbracket":   Keycode.LEFT_BRACKET,
+    "rbracket":   Keycode.RIGHT_BRACKET,
+    "backslash":  Keycode.BACKSLASH,
+    "semicolon":  Keycode.SEMICOLON,
+    "quote":      Keycode.QUOTE,
+    "comma":      Keycode.COMMA,
+    "period":     Keycode.PERIOD,
+    "slash":      Keycode.FORWARD_SLASH,
     # Numpad
     "num0":     Keycode.KEYPAD_ZERO,
     "num1":     Keycode.KEYPAD_ONE,
@@ -106,23 +122,34 @@ MOD_MAP = {
 }
 
 # ---------------------------------------------------------------------------
-# Command handler
-# Command format:  press<key>  or  press<mod>+<mod>+<key>
-# Examples:        press6  presstab  pressbacktick  pressctrl+c  pressalt+f4
+# Command handler (identical logic to WiFi code.py)
 # ---------------------------------------------------------------------------
+
+last_press1 = 0
+press1_cooldown = 0
+
 
 def handle_press(cmd):
     global last_press1, press1_cooldown
 
-    if not cmd.startswith("press"):
-        return  # ignore unknown commands
+    if cmd == "releaseall":
+        kbd.release_all()
+        print("Released all keys")
+        return
 
-    rest = cmd[5:]  # strip "press" prefix
+    if cmd.startswith("hold"):
+        action = "hold"
+        rest = cmd[4:]
+    elif cmd.startswith("press"):
+        action = "press"
+        rest = cmd[5:]
+    else:
+        return
+
     if not rest:
         return
 
-    # Special case: press1 has a randomised cooldown
-    if rest == "1":
+    if action == "press" and rest == "1":
         now = time.monotonic()
         if now - last_press1 >= press1_cooldown:
             kbd.send(Keycode.ONE)
@@ -133,7 +160,6 @@ def handle_press(cmd):
             print("press1 on cooldown")
         return
 
-    # Generic: split on '+' to separate modifiers from the key
     parts = rest.split("+")
     modifiers = []
     key = None
@@ -154,24 +180,30 @@ def handle_press(cmd):
         print(f"No key specified in: {rest!r}")
         return
 
-    kbd.send(*modifiers, key)
-    label = "+".join(parts)
-    print(f"Pressed {label}")
+    if action == "hold":
+        kbd.press(*modifiers, key)
+        print(f"Held {'+'.join(parts)}")
+    else:
+        kbd.send(*modifiers, key)
+        print(f"Pressed {'+'.join(parts)}")
 
 
 # ---------------------------------------------------------------------------
-# Main loop
+# Main loop — read commands from USB CDC serial
 # ---------------------------------------------------------------------------
 
+line_buf = ""
 while True:
-    while supervisor.runtime.serial_bytes_available:
-        ch = sys.stdin.read(1)
-        if ch in ("\r", "\n"):
-            cmd = buf.strip().lower()
-            buf = ""
-            if cmd:
-                handle_press(cmd)
-        else:
-            buf += ch
-
-    time.sleep(0.01)
+    n = supervisor.runtime.serial_bytes_available
+    if n:
+        data = sys.stdin.read(n)
+        for char in data:
+            if char in ("\n", "\r"):
+                cmd = line_buf.strip().lower()
+                if cmd:
+                    handle_press(cmd)
+                    sys.stdout.write(f"OK {cmd}\r\n")
+                line_buf = ""
+            else:
+                line_buf += char
+    time.sleep(0.001)

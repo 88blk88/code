@@ -1,9 +1,42 @@
 import json
+import sys
+import ctypes
 from pathlib import Path
 
 import cv2
 import mss
 import numpy as np
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_CONFIG_PATH = _PROJECT_ROOT / "config" / "settings.json"
+
+
+def _get_win_client_origin(title_substring: str) -> tuple[int, int] | None:
+    """Return screen (x, y) of the game window's client area top-left, or None."""
+    if sys.platform != "win32":
+        return None
+    import ctypes.wintypes as _wt
+    u32 = ctypes.windll.user32
+    found = [0]
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, _wt.HWND, _wt.LPARAM)
+    def _cb(hwnd, _):
+        if u32.IsWindowVisible(hwnd):
+            n = u32.GetWindowTextLengthW(hwnd)
+            if n:
+                buf = ctypes.create_unicode_buffer(n + 1)
+                u32.GetWindowTextW(hwnd, buf, n + 1)
+                if title_substring.lower() in buf.value.lower():
+                    found[0] = hwnd
+                    return False
+        return True
+
+    u32.EnumWindows(_cb, 0)
+    if not found[0]:
+        return None
+    pt = _wt.POINT(0, 0)
+    u32.ClientToScreen(found[0], ctypes.byref(pt))
+    return (pt.x, pt.y)
 
 
 def _draw_dashed_rect(img: np.ndarray, x1: int, y1: int, x2: int, y2: int,
@@ -148,32 +181,44 @@ def main():
         return
     ex, ey, ew, eh = result
 
-    settings = {
-        "widget_left": wx,
-        "widget_top": wy,
+    # Load existing settings so we only overwrite the widget coordinates
+    out = _CONFIG_PATH
+    settings = {}
+    if out.exists():
+        try:
+            settings = json.loads(out.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    # Convert absolute screen coordinates -> relative to game window client area
+    game_title = settings.get("game_window_title", "")
+    ox, oy = 0, 0
+    if game_title:
+        origin = _get_win_client_origin(game_title)
+        if origin is not None:
+            ox, oy = origin
+            print(f"[CALIBRATE] Game window '{game_title}' client origin: ({ox}, {oy}) — subtracting from coordinates")
+        else:
+            print(f"[CALIBRATE] WARNING: window '{game_title}' not found — saving absolute coordinates")
+    else:
+        print("[CALIBRATE] No game_window_title in settings — saving absolute coordinates")
+
+    settings.update({
+        "widget_left": wx - ox,
+        "widget_top": wy - oy,
         "widget_width": ww,
         "widget_height": wh,
-        "cp_threshold": 0.95,
-        "hp_threshold": 0.70,
-        "mp_threshold": 0.30,
         "pet_enabled": pet_enabled,
-        "pet_left": nx,
-        "pet_top": ny,
+        "pet_left": nx - ox,
+        "pet_top": ny - oy,
         "pet_width": nw,
         "pet_height": nh,
-        "pet_hp_threshold": 0.80,
-        "pet_mp_threshold": 0.30,
-        "enemy_left": ex,
-        "enemy_top": ey,
+        "enemy_left": ex - ox,
+        "enemy_top": ey - oy,
         "enemy_width": ew,
         "enemy_height": eh,
-        "serial_port": "COM4",
-        "serial_baud": 115200,
-        "alert_cooldown_sec": 2.0,
-        "poll_interval_sec": 0.10,
-    }
+    })
 
-    out = Path(r"c:\code\config\settings.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(settings, indent=2), encoding="utf-8")
 

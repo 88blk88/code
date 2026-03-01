@@ -1,7 +1,7 @@
 {
   "permissions": {
     "allow": [
-      "Bash(cmd /c:*)"
+      "Bash(c:code.venvScriptspython.exe -c \":*)"
     ]
   }
 }
