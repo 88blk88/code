@@ -180,17 +180,22 @@ def handle_press(cmd):
         print(f"No key specified in: {rest!r}")
         return
 
-    if action == "hold":
-        kbd.press(*modifiers, key)
-        print(f"Held {'+'.join(parts)}")
-    else:
-        kbd.send(*modifiers, key)
-        print(f"Pressed {'+'.join(parts)}")
+    try:
+        if action == "hold":
+            kbd.press(*modifiers, key)
+            print(f"Held {'+'.join(parts)}")
+        else:
+            kbd.send(*modifiers, key)
+            print(f"Pressed {'+'.join(parts)}")
+    except OSError as e:
+        print(f"HID error: {e}")
 
 
 # ---------------------------------------------------------------------------
 # Main loop — read commands from USB CDC serial
 # ---------------------------------------------------------------------------
+
+MAX_LINE_LENGTH = 1024  # discard buffer if no newline within this many chars
 
 line_buf = ""
 while True:
@@ -206,4 +211,7 @@ while True:
                 line_buf = ""
             else:
                 line_buf += char
+                if len(line_buf) > MAX_LINE_LENGTH:
+                    print("Buffer overflow, discarding")
+                    line_buf = ""
     time.sleep(0.001)

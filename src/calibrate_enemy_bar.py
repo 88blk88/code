@@ -21,7 +21,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CONFIG_PATH = _PROJECT_ROOT / "config" / "settings.json"
 
 sys.path.insert(0, str(Path(__file__).parent))
-from core import load_config, make_capture_regions
+from core import load_config, _ensure_dpi_aware, win_client_origin
 
 WINDOW = "Enemy bar calibration — press ENTER to sample, ESC to quit"
 
@@ -69,7 +69,24 @@ def render_preview(bgr: np.ndarray, label: str, s: dict, scale: int) -> np.ndarr
 def main():
     cfg = load_config()
     scale = cfg.calibration_scale
-    _, _, e_mon = make_capture_regions(cfg)   # same function hp_ns.py uses
+
+    # Use the same DPI-aware window detection as the bot
+    _ensure_dpi_aware()
+    game_title = cfg.game_window_title or (
+        cfg.focus_window_titles[0] if cfg.focus_window_titles else "")
+    ox, oy = 0, 0
+    if game_title:
+        origin = win_client_origin(game_title)
+        if origin is not None:
+            ox, oy = origin
+            print(f"[OK] Game window '{game_title}' at ({ox}, {oy})")
+        else:
+            print(f"[WARN] Window '{game_title}' not found — using (0,0)")
+    else:
+        print("[WARN] No game_window_title configured — using (0,0)")
+    e_mon = {"left": cfg.enemy_left + ox, "top": cfg.enemy_top + oy,
+             "width": cfg.enemy_width, "height": cfg.enemy_height}
+
     print(f"Enemy region: {e_mon}  ({cfg.enemy_width}x{cfg.enemy_height})")
     h = cfg.enemy_height
     mid = h * 3 // 4

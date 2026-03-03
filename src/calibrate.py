@@ -1,6 +1,5 @@
 import json
 import sys
-import ctypes
 from pathlib import Path
 
 import cv2
@@ -10,33 +9,8 @@ import numpy as np
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CONFIG_PATH = _PROJECT_ROOT / "config" / "settings.json"
 
-
-def _get_win_client_origin(title_substring: str) -> tuple[int, int] | None:
-    """Return screen (x, y) of the game window's client area top-left, or None."""
-    if sys.platform != "win32":
-        return None
-    import ctypes.wintypes as _wt
-    u32 = ctypes.windll.user32
-    found = [0]
-
-    @ctypes.WINFUNCTYPE(ctypes.c_bool, _wt.HWND, _wt.LPARAM)
-    def _cb(hwnd, _):
-        if u32.IsWindowVisible(hwnd):
-            n = u32.GetWindowTextLengthW(hwnd)
-            if n:
-                buf = ctypes.create_unicode_buffer(n + 1)
-                u32.GetWindowTextW(hwnd, buf, n + 1)
-                if title_substring.lower() in buf.value.lower():
-                    found[0] = hwnd
-                    return False
-        return True
-
-    u32.EnumWindows(_cb, 0)
-    if not found[0]:
-        return None
-    pt = _wt.POINT(0, 0)
-    u32.ClientToScreen(found[0], ctypes.byref(pt))
-    return (pt.x, pt.y)
+sys.path.insert(0, str(Path(__file__).parent))
+from core import _ensure_dpi_aware, win_client_origin
 
 
 def _draw_dashed_rect(img: np.ndarray, x1: int, y1: int, x2: int, y2: int,
@@ -126,7 +100,7 @@ def select_roi(window_name: str, image: np.ndarray, hint: str):
 
     cv2.destroyWindow(window_name)
 
-    if state["exit"]:
+    if state["exit"] or state["start"] is None or state["end"] is None:
         return None
 
     x1, y1 = state["start"]
@@ -136,11 +110,56 @@ def select_roi(window_name: str, image: np.ndarray, hint: str):
     return x, y, w, h
 
 
+def _find_monitor_containing(monitors: list[dict], x: int, y: int) -> dict | None:
+    """Return the mss monitor dict whose bounds contain (x, y), or None."""
+    for mon in monitors[1:]:  # skip monitors[0] (virtual desktop)
+        if (mon["left"] <= x < mon["left"] + mon["width"]
+                and mon["top"] <= y < mon["top"] + mon["height"]):
+            return mon
+    return None
+
+
 def main():
+    _ensure_dpi_aware()
+
+    # Load existing settings to read game_window_title
+    out = _CONFIG_PATH
+    settings = {}
+    if out.exists():
+        try:
+            settings = json.loads(out.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    game_title = settings.get("game_window_title", "")
+    ox, oy = 0, 0
+    origin = None
+    if game_title:
+        origin = win_client_origin(game_title)
+        if origin is not None:
+            ox, oy = origin
+            print(f"[CALIBRATE] Game window '{game_title}' client origin: ({ox}, {oy})")
+        else:
+            print(f"[CALIBRATE] WARNING: window '{game_title}' not found — will use primary monitor")
+    else:
+        print("[CALIBRATE] No game_window_title in settings — will use primary monitor")
+
     with mss.mss() as sct:
-        # Primary monitor screenshot
-        mon = sct.monitors[1]
+        # Screenshot the monitor that contains the game window
+        mon = None
+        if origin is not None:
+            mon = _find_monitor_containing(sct.monitors, ox, oy)
+            if mon:
+                print(f"[CALIBRATE] Game is on monitor: {mon}")
+            else:
+                print(f"[CALIBRATE] WARNING: ({ox}, {oy}) not inside any monitor — using primary")
+        if mon is None:
+            mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
         shot = np.array(sct.grab(mon))[:, :, :3]  # BGRA -> BGR
+
+    # ROI coordinates from select_roi are relative to the screenshot.
+    # Convert to absolute screen coords by adding the monitor's top-left.
+    mon_ox, mon_oy = mon["left"], mon["top"]
 
     # 1) Select Player's stats widget
     result = select_roi(
@@ -152,6 +171,7 @@ def main():
         print("Calibration cancelled.")
         return
     wx, wy, ww, wh = result
+    wx += mon_ox; wy += mon_oy
 
     # 2) Optionally select Pet's stats widget
     pet_enabled = False
@@ -169,6 +189,7 @@ def main():
             print("Calibration cancelled.")
             return
         nx, ny, nw, nh = result
+        nx += mon_ox; ny += mon_oy
 
     # 3) Select enemy stats widget
     result = select_roi(
@@ -180,28 +201,13 @@ def main():
         print("Calibration cancelled.")
         return
     ex, ey, ew, eh = result
-
-    # Load existing settings so we only overwrite the widget coordinates
-    out = _CONFIG_PATH
-    settings = {}
-    if out.exists():
-        try:
-            settings = json.loads(out.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+    ex += mon_ox; ey += mon_oy
 
     # Convert absolute screen coordinates -> relative to game window client area
-    game_title = settings.get("game_window_title", "")
-    ox, oy = 0, 0
-    if game_title:
-        origin = _get_win_client_origin(game_title)
-        if origin is not None:
-            ox, oy = origin
-            print(f"[CALIBRATE] Game window '{game_title}' client origin: ({ox}, {oy}) — subtracting from coordinates")
-        else:
-            print(f"[CALIBRATE] WARNING: window '{game_title}' not found — saving absolute coordinates")
+    if origin is not None:
+        print(f"[CALIBRATE] Subtracting window origin ({ox}, {oy}) from coordinates")
     else:
-        print("[CALIBRATE] No game_window_title in settings — saving absolute coordinates")
+        print("[CALIBRATE] Saving absolute coordinates (no window found)")
 
     settings.update({
         "widget_left": wx - ox,

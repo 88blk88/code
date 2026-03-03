@@ -183,12 +183,15 @@ def handle_press(cmd):
         print(f"No key specified in: {rest!r}")
         return
 
-    if action == "hold":
-        kbd.press(*modifiers, key)
-        print(f"Held {'+'.join(parts)}")
-    else:
-        kbd.send(*modifiers, key)
-        print(f"Pressed {'+'.join(parts)}")
+    try:
+        if action == "hold":
+            kbd.press(*modifiers, key)
+            print(f"Held {'+'.join(parts)}")
+        else:
+            kbd.send(*modifiers, key)
+            print(f"Pressed {'+'.join(parts)}")
+    except OSError as e:
+        print(f"HID error: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -233,10 +236,13 @@ print(f"Listening on {wifi.radio.ipv4_address}:{PORT}")
 # Main loop — accept one client at a time
 # ---------------------------------------------------------------------------
 
+MAX_LINE_LENGTH = 1024  # discard buffer if no newline within this many bytes
+
 while True:
     print("Waiting for connection...")
     conn, addr = server.accept()
     print(f"Client connected: {addr}")
+    conn.settimeout(10)  # prevent recv_into from blocking forever
 
     line_buf = b""
     while True:
@@ -246,6 +252,10 @@ while True:
             if n == 0:
                 break                          # client closed connection
             line_buf += bytes(chunk[:n])
+            if len(line_buf) > MAX_LINE_LENGTH:
+                print("Buffer overflow, discarding")
+                line_buf = b""
+                continue
             while b"\n" in line_buf:
                 line, line_buf = line_buf.split(b"\n", 1)
                 cmd = line.strip(b"\r").decode("utf-8", "replace").lower()
@@ -255,5 +265,6 @@ while True:
         except OSError:
             break                              # connection reset / timeout
 
+    kbd.release_all()  # release any held keys on disconnect
     conn.close()
-    print("Client disconnected.")
+    print("Client disconnected — all keys released.")

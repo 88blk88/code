@@ -3,7 +3,6 @@
 Run:  python src/hp_ns.py [--no-preview]
 """
 
-import os
 import io
 import logging
 import logging.handlers
@@ -17,8 +16,6 @@ import sys
 import ctypes
 import subprocess
 from pathlib import Path
-
-import keyboard
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -88,7 +85,7 @@ import mss
 import numpy as np
 
 from core import (
-    MonitorConfig, load_config, send_pico_command, alert_beep,
+    MonitorConfig, load_config, send_pico_command, alert_beep, idle_beep, no_enemy_warning,
     on_low_cp, on_low_hp, on_low_mp,
     on_low_pet_hp, on_low_pet_mp,
     get_ocr_engine,
@@ -206,28 +203,37 @@ def main() -> None:
     player_actions = [on_low_cp, on_low_hp, on_low_mp]
     player_ratios = [1.0, 1.0, 1.0]
     player_last_alerts = [0.0, 0.0, 0.0]
+    _player_last_ocr_ts: float = 0.0
+    _player_stale_warned: bool = False
+    OCR_STALE_SEC = 5.0  # warn if OCR hasn't updated in this many seconds
 
     # Pet bars
     pet_thresholds = [cfg.pet_hp_threshold, cfg.pet_mp_threshold]
     pet_alert_enabled = [cfg.alert_pet_hp_enabled, cfg.alert_pet_mp_enabled]
     pet_ratios = [1.0, 1.0]
     pet_last_alerts = [0.0, 0.0]
-    # Pet HP healing threshold is editable via settings
-    pet_hp_heal_threshold = cfg.pet_hp_heal_threshold
-    pet_hp_heal_cd = 0.0
-    pet_last_hp_heal = 0.0
+    # Pet HP healing (separate from alert) — requires consecutive low readings
+    pet_heal_threshold = cfg.pet_heal_threshold
+    pet_heal_cd = 0.0
+    pet_last_heal = 0.0
+    pet_heal_low_count: int = 0        # consecutive OCR readings below threshold
+    PET_HEAL_CONFIRM_REQUIRED = 2      # must see low HP this many times before healing
+    _pet_last_ocr_ts: float = 0.0      # track which OCR cycle we last processed
+    _pet_stale_warned: bool = False
     pet_actions = [lambda r: on_low_pet_hp(r, cfg), on_low_pet_mp]
     pet_present: bool = True      # updated by periodic presence check
     last_pet_check: float = 0.0
     PET_PRESENCE_CHECK_SEC = 10.0
 
-    # Scheduled skill presses
-    last_press8 = 0.0
-    last_press9 = 0.0
-    last_press10 = 0.0
+    # Scheduled skill presses — initialise to now so first press waits a full interval
+    _init_now = time.time()
+    last_press8 = _init_now
+    last_press9 = _init_now
+    last_press10 = _init_now
+    last_press11 = _init_now
     _attack_2nd_at: float = 0.0          # timestamp to fire follow-up attack (0 = none pending)
     _buff_grace_until: float = 0.0       # suppress attack keypresses until this timestamp
-    _last_buff_2nd_window: float = 0.0   # timestamp of last periodic secondary-window action
+    _last_buff_2nd_window: float = _init_now   # timestamp of last periodic secondary-window action
     _scryde_lock = threading.Lock()      # prevent concurrent window-switch threads
 
     def _do_switch_and_attack(target: str, game: str, key: str,
@@ -253,6 +259,7 @@ def main() -> None:
 
     def _run_focus_test():
         import traceback
+        _e_mon_snap = dict(e_mon)  # snapshot — main loop may reassign e_mon
         if not _scryde_lock.acquire(blocking=False):
             print("[SCRYDE] Skipped — previous switch still in progress")
             return
@@ -264,7 +271,7 @@ def main() -> None:
             # Check if enemy still alive
             time.sleep(0.2)
             with mss.mss() as _sct:
-                _e_shot = np.array(_sct.grab(e_mon))[:, :, :3]
+                _e_shot = np.array(_sct.grab(_e_mon_snap))[:, :, :3]
             if enemy_bar_empty(_e_shot, cfg)[0]:
                 print(f"[SCRYDE] No target after switch — {cfg.key_next_target_near}")
                 _send_near()
@@ -281,7 +288,7 @@ def main() -> None:
         while time.time() < _deadline:
             time.sleep(0.15)
             with mss.mss() as _sct2:
-                _e_shot2 = np.array(_sct2.grab(e_mon))[:, :, :3]
+                _e_shot2 = np.array(_sct2.grab(_e_mon_snap))[:, :, :3]
             if not enemy_bar_empty(_e_shot2, cfg)[0]:
                 if not _scryde_lock.acquire(blocking=False):
                     print("[SCRYDE] New target found but lock busy — main loop will handle")
@@ -328,7 +335,6 @@ def main() -> None:
     _tab_near_held: bool = False           # next_target_near held (add_hold_shift mode)
     _tab_far_held: bool = False            # next_target_far held (add_hold_shift mode)
     e_bar_red: float = 0.0                 # most recent mean_red from enemy pixel check
-    cfg.idle_resume_sec = 3.0
 
     if get_ocr_engine() is None:
         print("[ERROR] Install: pip install rapidocr-onnxruntime")
@@ -343,8 +349,7 @@ def main() -> None:
     _last_win_pos_check = time.time()
     WIN_POS_CHECK_SEC = 1.0
 
-    sct = mss.mss()
-    try:
+    with mss.mss() as sct:
         player_mon, pet_mon, e_mon = make_capture_regions(cfg)
         _win_ox = player_mon["left"] - cfg.widget_left
         _win_oy = player_mon["top"]  - cfg.widget_top
@@ -356,7 +361,6 @@ def main() -> None:
 
         player_shot = np.zeros((max(1, cfg.widget_height), max(1, cfg.widget_width), 3), dtype=np.uint8)
         pet_shot    = np.zeros((max(1, cfg.pet_height),    max(1, cfg.pet_width),    3), dtype=np.uint8)
-        e_shot      = np.zeros((max(1, cfg.enemy_height),  max(1, cfg.enemy_width),  3), dtype=np.uint8)
 
         screen_h = sct.monitors[1]["height"]
         screen_w = sct.monitors[1]["width"]
@@ -370,8 +374,12 @@ def main() -> None:
         bot_paused    = [False]   # True when any of the above is True
 
         def _add_shift(press_cmd: str) -> str:
-            """Insert 'shift+' modifier: 'press6' -> 'pressshift+6'."""
-            return "press" + "shift+" + press_cmd[5:] if press_cmd.startswith("press") else press_cmd
+            """Insert 'shift+' modifier: 'press6' -> 'pressshift+6', 'hold6' -> 'holdshift+6'."""
+            if press_cmd.startswith("press"):
+                return "press" + "shift+" + press_cmd[5:]
+            if press_cmd.startswith("hold"):
+                return "hold" + "shift+" + press_cmd[4:]
+            return press_cmd
 
         def _make_hold_cmd(press_cmd: str) -> str:
             """Convert 'press6' -> 'hold6' for hold mode."""
@@ -449,9 +457,6 @@ def main() -> None:
         _VK_F4, _VK_F5, _VK_F6 = 0x73, 0x74, 0x75
         _hotkey_stop = threading.Event()
 
-        _main_loop_heartbeat = time.time()
-        _WATCHDOG_TIMEOUT = 10.0  # force-exit if main loop stuck for this long
-
         def _hotkey_poll_thread():
             _prev = {_VK_F4: False, _VK_F5: False, _VK_F6: False}
             _bindings = ((_VK_F4, toggle_pause), (_VK_F5, unpause), (_VK_F6, trigger_focus_test))
@@ -462,10 +467,6 @@ def main() -> None:
                         if _dn and not _prev[_vk]:
                             _cb()
                         _prev[_vk] = _dn
-                # Watchdog: force-exit if main loop is stuck in native code
-                if time.time() - _main_loop_heartbeat > _WATCHDOG_TIMEOUT:
-                    print(f"\n[WATCHDOG] Main loop stuck for >{_WATCHDOG_TIMEOUT:.0f}s — force-exiting!")
-                    os._exit(1)
                 _hotkey_stop.wait(0.02)  # 20 ms poll — fast enough to catch any keypress
 
         threading.Thread(target=_hotkey_poll_thread, daemon=True, name="HotkeyPoll").start()
@@ -478,8 +479,6 @@ def main() -> None:
             print("Monitor started (Player + Pet + Enemy). Press F4 to pause/resume, F5 to resume. Press Ctrl+C or Esc to stop.")
 
         while True:
-            _main_loop_heartbeat = time.time()
-
             # --- Window position tracking — update capture regions if window moved ---
             if _game_title and time.time() - _last_win_pos_check >= WIN_POS_CHECK_SEC:
                 _last_win_pos_check = time.time()
@@ -492,17 +491,27 @@ def main() -> None:
                     _ocr_worker.update_origin(_win_ox, _win_oy)
                     print(f"[WINDOW] Position updated: ({_win_ox}, {_win_oy})")
 
-            # Read cached captures from background worker — main thread never calls sct.grab()
-            _bar_empty, e_bar_red, _bar_ts = _ocr_worker.get_enemy_bar_pixel()
-            _last_e_shot, _last_p_shot, _last_pt_shot = _ocr_worker.get_last_shots()
-            if _last_e_shot is not None:
-                e_shot = _last_e_shot
+            try:
+                e_shot = np.array(sct.grab(e_mon))[:, :, :3]
+            except Exception as exc:
+                print(f"\n[MSS] Enemy grab failed: {exc}")
+                time.sleep(0.1)
+                continue
 
+            # Grab Player / Pet only when preview is due (OCR handled by background worker)
             preview_due = cfg.show_preview and (time.time() - last_preview_update >= PREVIEW_INTERVAL)
-            if preview_due and _last_p_shot is not None:
-                player_shot = _last_p_shot
-            if preview_due and cfg.pet_enabled and cfg.pet_width > 0 and _last_pt_shot is not None:
-                pet_shot = _last_pt_shot
+            if preview_due:
+                try:
+                    player_shot = np.array(sct.grab(player_mon))[:, :, :3]
+                except Exception as exc:
+                    print(f"\n[MSS] Player grab failed: {exc}")
+                    preview_due = False
+            if preview_due and cfg.pet_enabled and cfg.pet_width > 0:
+                try:
+                    pet_shot = np.array(sct.grab(pet_mon))[:, :, :3]
+                except Exception as exc:
+                    print(f"\n[MSS] Pet grab failed: {exc}")
+                    preview_due = False
 
             # --- Event Watcher check ---
             if time.time() - last_event_check >= EVENT_CHECK_SEC:
@@ -542,20 +551,28 @@ def main() -> None:
                 continue
 
             # ---- Scheduled skill presses (highest priority) ----
+            # Each buff respects _buff_grace_until so they fire one at a time,
+            # spaced by their grace periods (prevents animation overlap).
             now = time.time()
-            if now - last_press10 >= cfg.buff3_interval_sec:
+            if now >= _buff_grace_until and now - last_press11 >= cfg.buff4_interval_sec:
+                print(f"\n[BUFF4] {cfg.key_buff4} ({cfg.buff4_interval_sec:.0f}s)")
+                send_pico_command(cfg, _add_shift(cfg.key_buff4) if cfg.add_shift_buff4 else cfg.key_buff4)
+                last_press11 = now
+                if cfg.buff4_grace_sec > 0:
+                    _buff_grace_until = max(_buff_grace_until, now + cfg.buff4_grace_sec)
+            if now >= _buff_grace_until and now - last_press10 >= cfg.buff3_interval_sec:
                 print(f"\n[BUFF3] {cfg.key_buff3} ({cfg.buff3_interval_sec:.0f}s)")
                 send_pico_command(cfg, _add_shift(cfg.key_buff3) if cfg.add_shift_buff3 else cfg.key_buff3)
                 last_press10 = now
                 if cfg.buff3_grace_sec > 0:
                     _buff_grace_until = max(_buff_grace_until, now + cfg.buff3_grace_sec)
-            if now - last_press9 >= cfg.buff2_interval_sec:
+            if now >= _buff_grace_until and now - last_press9 >= cfg.buff2_interval_sec:
                 print(f"\n[BUFF2] {cfg.key_buff2} ({cfg.buff2_interval_sec:.0f}s)")
                 send_pico_command(cfg, _add_shift(cfg.key_buff2) if cfg.add_shift_buff2 else cfg.key_buff2)
                 last_press9 = now
                 if cfg.buff2_grace_sec > 0:
                     _buff_grace_until = max(_buff_grace_until, now + cfg.buff2_grace_sec)
-            if now - last_press8 >= cfg.buff1_interval_sec:
+            if now >= _buff_grace_until and now - last_press8 >= cfg.buff1_interval_sec:
                 print(f"\n[BUFF1] {cfg.key_buff1} ({cfg.buff1_interval_sec:.0f}s)")
                 send_pico_command(cfg, _add_shift(cfg.key_buff1) if cfg.add_shift_buff1 else cfg.key_buff1)
                 last_press8 = now
@@ -630,6 +647,7 @@ def main() -> None:
                             _send_far()
                             last_tab_time = now
                             e_state, e_tab_attempts, e_hp = SEARCHING, 0, -1.0
+                            _ocr_worker.clear_enemy()
                             e_last_attack, e_attack_cd = now, random.uniform(cfg.attack_cd_min, cfg.attack_cd_max)
                             e_stuck_attacks, e_hp_at_attack = 0, -1.0
                             empty_frames = 0
@@ -657,7 +675,7 @@ def main() -> None:
             # has_enemy = False, leaving it undetected. Run unconditionally every frame.
             # Requires EMPTY_FRAMES_REQUIRED consecutive detections to avoid
             # acting on single-frame false positives during targeting transitions.
-            if enemy_widget_is_player(e_shot):
+            if enemy_widget_is_player(e_shot, cfg):
                 self_target_frames += 1
                 if self_target_frames >= EMPTY_FRAMES_REQUIRED and now - last_tab_time >= cfg.tab_cooldown_sec:
                     print(f"\n[SELF-TARGET] Player bar detected x{self_target_frames} — TAB to change target")
@@ -666,6 +684,7 @@ def main() -> None:
                     now = time.time()
                     last_tab_time = now
                     e_state, e_tab_attempts, e_hp = SEARCHING, 0, -1.0
+                    _ocr_worker.clear_enemy()
                     e_last_attack, e_stuck_attacks, e_hp_at_attack = 0.0, 0, -1.0
                     empty_frames = 0
                     self_target_frames = 0
@@ -677,13 +696,15 @@ def main() -> None:
                 has_enemy = False
             else:
                 self_target_frames = 0
-                # Primary: pixel check from background worker cache (never blocks main thread).
-                # At low HP the bar is thin and can look empty while alive; OCR overrides below.
+                # Primary: pixel check every frame. At low HP the bar is thin and can
+                # look empty even while the enemy is alive; OCR is used to override.
+                _bar_empty, e_bar_red = enemy_bar_empty(e_shot, cfg)
                 has_enemy = not _bar_empty
             if has_enemy:
-                _, _, hp_str = _ocr_worker.get_enemy()
+                _, _, hp_str, _worker_ts = _ocr_worker.get_enemy_with_ts()
             else:
                 hp_str = None
+                _worker_ts = 0.0
             now = time.time()
 
             # Parse hp_str -> float for combat logic (more reliable: requires % sign)
@@ -699,7 +720,6 @@ def main() -> None:
             prev_ocr_ts = e_last_ocr_success  # timestamp when prev_e_hp was last set from OCR
             if hp_str_val is not None:
                 e_hp = hp_str_val
-                _worker_ts = _ocr_worker.get_enemy_ts()
                 e_last_ocr_success = _worker_ts
                 if _worker_ts > _last_count_ts:      # only count each new OCR cycle once
                     _last_count_ts = _worker_ts
@@ -738,7 +758,7 @@ def main() -> None:
                             search_found_frames = 0
                             e_search_has_enemy_start = 0.0
                             _no_enemy_cycles = 0
-                            e_hp_at_attack = -1.0  # don't seed until first Re-A (avoids free stuck +1)
+                            e_hp_at_attack = e_hp  # seed stuck detection from first attack
                             last_tab_time = now
                             if e_last_attack == 0.0:
                                 # No TAB was pressed; fire initial attack now
@@ -765,7 +785,6 @@ def main() -> None:
                             empty_frames = 0
                             search_empty_frames = 0
                             e_search_has_enemy_start = 0.0
-                            e_hp_at_attack = -1.0  # don't seed until first Re-A
                             last_tab_time = now
                             if e_last_attack == 0.0:
                                 if now >= _buff_grace_until:
@@ -789,14 +808,14 @@ def main() -> None:
                         if e_tab_attempts > e_max_tabs:
                             _no_enemy_cycles += 1
                             print(f"\n[STATE] SEARCHING -> IDLE ({e_max_tabs} TABs failed, no-enemy cycle {_no_enemy_cycles}/{cfg.max_no_enemy_cycles})")
-                            alert_beep()
+                            if cfg.alert_idle_enabled:
+                                idle_beep()
                             _send_far()
                             now = time.time()
                             last_tab_time = now
                             if _no_enemy_cycles >= cfg.max_no_enemy_cycles:
-                                print(f"[BOT] No enemy found after {cfg.max_no_enemy_cycles} search cycles — auto-pausing. Press F5 to resume.")
-                                _event_paused[0] = True
-                                _sync_paused()
+                                print(f"[BOT] No enemy found after {cfg.max_no_enemy_cycles} search cycles — warning!")
+                                no_enemy_warning()
                                 _no_enemy_cycles = 0
                             e_state = IDLE
                             e_idle_since = now
@@ -835,6 +854,7 @@ def main() -> None:
                         else:
                             last_tab_time = now - cfg.tab_cooldown_sec
                         e_state, e_tab_attempts, e_hp = SEARCHING, 0, -1.0
+                        _ocr_worker.clear_enemy()
                         e_last_attack, e_stuck_attacks, e_hp_at_attack = 0.0, 0, -1.0
                         empty_frames = 0
                         self_target_frames = 0
@@ -869,8 +889,7 @@ def main() -> None:
                         e_state, e_tab_attempts = ATTACKING, 0
                         empty_frames = 0
                         search_found_frames = 0
-                        e_hp_at_attack = -1.0  # don't seed until first Re-A (avoids free stuck +1)
-                        e_last_attack = 0.0    # reset so initial attack block fires (not stale Re-A)
+                        e_hp_at_attack = e_hp  # seed stuck detection from first attack
                         last_tab_time = now
                         if e_last_attack == 0.0:
                             if now >= _buff_grace_until:
@@ -898,27 +917,46 @@ def main() -> None:
                     search_found_frames = 0  # no enemy or OCR unavailable — reset confirmation
 
             # ---- Player OCR ----
-            player_ocr = _ocr_worker.get_player()
-            for i in range(min(len(player_ocr), 3)):
-                player_ratios[i] = player_ocr[i]
+            player_ocr, _player_ts = _ocr_worker.get_player_with_ts()
+            _player_fresh = _player_ts > _player_last_ocr_ts
+            if _player_fresh:
+                _player_last_ocr_ts = _player_ts
+                _player_stale_warned = False
+                for i in range(min(len(player_ocr), 3)):
+                    player_ratios[i] = player_ocr[i]
             if bot_paused[0]:
                 continue
             now = time.time()
-            for i in range(3):
-                if player_alert_enabled[i] and player_ratios[i] < player_thresholds[i] and (now - player_last_alerts[i]) >= cfg.alert_cooldown_sec:
-                    alert_beep()
-                    player_actions[i](player_ratios[i])
-                    player_last_alerts[i] = now
+            _player_stale = _player_last_ocr_ts > 0 and now - _player_last_ocr_ts > OCR_STALE_SEC
+            if _player_stale:
+                if not _player_stale_warned:
+                    print(f"\n[WARN] Player OCR stale ({now - _player_last_ocr_ts:.1f}s) — skipping alerts")
+                    _player_stale_warned = True
+            else:
+                for i in range(3):
+                    if player_alert_enabled[i] and player_ratios[i] < player_thresholds[i] and (now - player_last_alerts[i]) >= cfg.alert_cooldown_sec:
+                        alert_beep()
+                        player_actions[i](player_ratios[i])
+                        player_last_alerts[i] = now
 
-            # Stop if Player HP hits 0
-            if player_ratios[1] <= 0.0:
-                print(f"\n[PLAYER] HP is 0% \u2014 stopping script.")
-                alert_beep()
-                break
+                # Stop if Player HP hits 0
+                if player_ratios[1] <= 0.0:
+                    print(f"\n[PLAYER] HP is 0% \u2014 stopping script.")
+                    alert_beep()
+                    break
 
             # ---- Pet OCR ----
-            pet_ocr = _ocr_worker.get_pet()
+            pet_ocr, _pet_ts = _ocr_worker.get_pet_with_ts()
             now = time.time()
+            _pet_fresh = _pet_ts > _pet_last_ocr_ts  # new OCR cycle since last check
+            if _pet_fresh:
+                _pet_last_ocr_ts = _pet_ts
+                _pet_stale_warned = False
+            _pet_stale = _pet_last_ocr_ts > 0 and now - _pet_last_ocr_ts > OCR_STALE_SEC
+            if _pet_stale and not _pet_stale_warned:
+                print(f"\n[WARN] Pet OCR stale ({now - _pet_last_ocr_ts:.1f}s) — skipping alerts/heal")
+                _pet_stale_warned = True
+                pet_heal_low_count = 0  # reset heal confirmation on stale data
             # Periodic presence check every PET_PRESENCE_CHECK_SEC
             if now - last_pet_check >= PET_PRESENCE_CHECK_SEC:
                 last_pet_check = now
@@ -926,20 +964,28 @@ def main() -> None:
                 if new_present != pet_present:
                     pet_present = new_present
                     print(f"\n[PET] Widget {'detected' if pet_present else 'not found'} — reactions {'enabled' if pet_present else 'disabled'}")
-            if not bot_paused[0] and pet_present:
-                for i in range(min(len(pet_ocr), 2)):
-                    pet_ratios[i] = pet_ocr[i]
+            if not bot_paused[0] and pet_present and not _pet_stale:
+                # Only update ratios from fresh OCR data (ignore stale cache)
+                if _pet_fresh and len(pet_ocr) >= 2:
+                    for i in range(min(len(pet_ocr), 2)):
+                        pet_ratios[i] = pet_ocr[i]
                 for i in range(2):
                     if pet_alert_enabled[i] and pet_ratios[i] < pet_thresholds[i] and (now - pet_last_alerts[i]) >= cfg.alert_cooldown_sec:
                         alert_beep()
                         pet_actions[i](pet_ratios[i])
                         pet_last_alerts[i] = now
-                # Pet HP heal (press1) when HP < threshold
-                if cfg.alert_pet_hp_heal_enabled and pet_ratios[0] < pet_hp_heal_threshold and (now - pet_last_hp_heal) >= pet_hp_heal_cd:
-                    print(f"\n[PET] HP {pet_ratios[0]:.0%} < {pet_hp_heal_threshold:.0%} — {cfg.key_heal_pet}")
-                    send_pico_command(cfg, _add_shift(cfg.key_heal_pet) if cfg.add_shift_heal_pet else cfg.key_heal_pet)
-                    pet_last_hp_heal, pet_hp_heal_cd = now, random.uniform(3.0, 3.5)
-                    pet_last_alerts[0] = now + pet_hp_heal_cd - cfg.alert_cooldown_sec  # suppress alert during heal animation
+                # Pet HP heal — requires consecutive fresh low readings to avoid misread triggers
+                if cfg.pet_heal_enabled and (now - pet_last_heal) >= pet_heal_cd:
+                    if _pet_fresh and pet_ratios[0] < pet_heal_threshold:
+                        pet_heal_low_count += 1
+                        if pet_heal_low_count >= PET_HEAL_CONFIRM_REQUIRED:
+                            print(f"\n[PET HEAL] HP {pet_ratios[0]:.0%} < {pet_heal_threshold:.0%} (confirmed x{pet_heal_low_count}) — {cfg.key_heal_pet}")
+                            send_pico_command(cfg, _add_shift(cfg.key_heal_pet) if cfg.add_shift_heal_pet else cfg.key_heal_pet)
+                            pet_last_heal, pet_heal_cd = now, random.uniform(3.0, 3.5)
+                            pet_last_alerts[0] = now + pet_heal_cd - cfg.alert_cooldown_sec
+                            pet_heal_low_count = 0
+                    elif _pet_fresh:
+                        pet_heal_low_count = 0  # fresh reading above threshold — reset
 
             # ---- Status line ----
             cp_r, hp_r, mp_r = player_ratios
@@ -957,8 +1003,9 @@ def main() -> None:
             if _ctrl_c_stop.is_set() or cv2.waitKey(1) & 0xFF == 27:
                 break
 
-    finally:
-        sct.close()
+            # Throttle main loop to prevent 100% CPU / blocked Ctrl+C / frozen preview
+            time.sleep(cfg.poll_interval_sec)
+
     try:
         _release_holds()  # ensure no attack keys are stuck held on exit
         _hotkey_stop.set()

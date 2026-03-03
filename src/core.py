@@ -56,8 +56,8 @@ class MonitorConfig:
     alert_pet_hp_enabled: bool = True
     pet_mp_threshold: float = 0.30
     alert_pet_mp_enabled: bool = True
-    pet_hp_heal_threshold: float = 0.70
-    alert_pet_hp_heal_enabled: bool = True
+    pet_heal_enabled: bool = True
+    pet_heal_threshold: float = 0.70
 
     # Enemy widget (HP%)
     enemy_left: int = 1229
@@ -109,9 +109,17 @@ class MonitorConfig:
     add_shift_buff2: bool = False
     key_buff3: str = "press10"           # scheduled buff 3
     add_shift_buff3: bool = False
+    key_buff4: str = "press11"           # scheduled buff 4
+    add_shift_buff4: bool = False
 
     enemy_bar_full_red: float = 80.0          # minimum mean_red for enemy bar detection
     enemy_bar_full_rg_ratio: float = 2.0      # minimum R/G ratio for enemy bar detection
+    player_bar_min_red: float = 90.0          # player self-target detection: min R
+    player_bar_max_red: float = 180.0         # player self-target detection: max R
+    player_bar_max_blue: float = 80.0         # player self-target detection: max B
+    player_bar_min_rg: float = 1.0            # player self-target detection: min R/G
+    player_bar_max_rg: float = 2.0            # player self-target detection: max R/G
+    player_bar_min_gb: float = 1.6            # player self-target detection: min G/B
     calibration_scale: int = 8    # upscale factor for the calibrate_enemy_bar.py preview window
 
     # Buff intervals and grace periods (seconds)
@@ -121,6 +129,8 @@ class MonitorConfig:
     buff2_grace_sec: float = 0.0
     buff3_interval_sec: float = 19 * 60.0      # 19min
     buff3_grace_sec: float = 0.0
+    buff4_interval_sec: float = 19 * 60.0      # 19min
+    buff4_grace_sec: float = 0.0
 
     # Periodic action in the secondary window (test_target_window)
     key_buff_2nd_window: str = "press7"           # key to send in secondary window every buff_2nd_window_interval_sec
@@ -130,7 +140,9 @@ class MonitorConfig:
     buff_2nd_window_stay_sec: float = 2.5        # how long to keep secondary focused after key
 
     # Combat timing (moved from hp_ns.py constants)
-    tab_cooldown_sec: float = 1.5        # minimum seconds between TAB presses
+    alert_idle_enabled: bool = True       # beep when SEARCHING -> IDLE transition occurs
+
+    tab_cooldown_sec: float = 1.0        # minimum seconds between TAB presses
     max_no_enemy_cycles: int = 10        # SEARCHING->IDLE cycles before auto-pause
     attack_cd_min: float = 3.0           # attack cooldown range (seconds)
     attack_cd_max: float = 4.0
@@ -291,7 +303,7 @@ def _get_serial(cfg: MonitorConfig):
         print("\n[SERIAL] pyserial not installed.")
         return None
     try:
-        _serial_conn = _serial_mod.Serial(cfg.serial_port, cfg.serial_baud, timeout=0.1)
+        _serial_conn = _serial_mod.Serial(cfg.serial_port, cfg.serial_baud, timeout=0.1, write_timeout=1.0)
         print(f"[SERIAL] Connected to {cfg.serial_port}")
         return _serial_conn
     except Exception as e:
@@ -364,6 +376,26 @@ def alert_beep() -> None:
     _t.Thread(target=_play, daemon=True).start()
 
 
+def idle_beep() -> None:
+    """Play a soft descending triple tone indicating idle state (non-blocking)."""
+    import threading as _t
+    def _play():
+        winsound.Beep(700, 100)
+        winsound.Beep(550, 110)
+        winsound.Beep(400, 140)
+    _t.Thread(target=_play, daemon=True).start()
+
+
+def no_enemy_warning() -> None:
+    """Play a prolonged warning sound when max idle cycles reached (non-blocking)."""
+    import threading as _t
+    def _play():
+        for _ in range(3):
+            winsound.Beep(1800, 300)
+            winsound.Beep(600, 300)
+    _t.Thread(target=_play, daemon=True).start()
+
+
 # ---------------------------------------------------------------------------
 # Action callbacks
 # ---------------------------------------------------------------------------
@@ -381,10 +413,7 @@ def on_low_mp(mp_ratio: float) -> None:
 
 
 def on_low_pet_hp(hp_ratio: float, cfg: MonitorConfig | None = None) -> None:
-    print(f"\n[ACTION] Pet low HP at {hp_ratio:.1%} -> pressing 1 via Pico")
-    if cfg is not None:
-        print(f"[ACTION] About to send '{cfg.key_heal_pet}' to Pico for Pet low HP.")
-        send_pico_command(cfg, cfg.key_heal_pet)
+    print(f"\n[ALERT] Pet low HP at {hp_ratio:.1%}")
 
 
 def on_low_pet_mp(mp_ratio: float) -> None:
@@ -449,14 +478,7 @@ def _extract_percentages(text: str) -> list[float]:
     ratios = []
     for m in matches:
         val = float(m)
-        if 0.0 <= val <= 100.0:
-            ratios.append(val / 100.0)
-    if ratios:
-        return ratios
-    matches = re.findall(r"\b(\d{1,3}(?:\.\d+)?)\b", text)
-    for m in matches:
-        val = float(m)
-        if 0.0 <= val <= 100.0:
+        if 0.0 < val <= 100.0:  # reject 0% — OCR artifact, live enemy can't be 0%
             ratios.append(val / 100.0)
     return ratios
 
@@ -567,7 +589,7 @@ def ocr_enemy_widget(bgr_widget: np.ndarray) -> tuple[bool, float | None, str | 
     return (False, None, None)
 
 
-def enemy_widget_is_player(bgr_widget: np.ndarray) -> bool:
+def enemy_widget_is_player(bgr_widget: np.ndarray, cfg: MonitorConfig | None = None) -> bool:
     """Pixel check: does the enemy widget show the player's own CP bar (golden/amber)?
 
     Calibrated from player_bar_color.png: B=46.7 G=101.4 R=131.0
@@ -576,6 +598,13 @@ def enemy_widget_is_player(bgr_widget: np.ndarray) -> bool:
     Intended to be called unconditionally every frame — only logs on detection.
     Enemy bar fails this check because its R/G >> 2.0.
     """
+    min_r = cfg.player_bar_min_red if cfg else 90.0
+    max_r = cfg.player_bar_max_red if cfg else 180.0
+    max_b = cfg.player_bar_max_blue if cfg else 80.0
+    min_rg = cfg.player_bar_min_rg if cfg else 1.0
+    max_rg = cfg.player_bar_max_rg if cfg else 2.0
+    min_gb = cfg.player_bar_min_gb if cfg else 1.6
+
     h, w = bgr_widget.shape[:2]
     x_end = max(6, w // 10)       # left 10% of bar width
     trim = max(2, h // 4)         # ~25% top/bottom trim against misalignment
@@ -586,10 +615,10 @@ def enemy_widget_is_player(bgr_widget: np.ndarray) -> bool:
     rg_ratio = mean_r / mean_g if mean_g > 0 else 0.0
     gb_ratio = mean_g / mean_b if mean_b > 0 else 0.0
     is_player = (
-        90 <= mean_r < 180
-        and mean_b < 80
-        and 1.0 <= rg_ratio < 2.0
-        and gb_ratio >= 1.6
+        min_r <= mean_r < max_r
+        and mean_b < max_b
+        and min_rg <= rg_ratio < max_rg
+        and gb_ratio >= min_gb
     )
     if is_player:
         print(f"[PIXEL] PLAYER BAR detected: R={mean_r:.1f} G={mean_g:.1f} B={mean_b:.1f} R/G={rg_ratio:.2f} G/B={gb_ratio:.2f}")

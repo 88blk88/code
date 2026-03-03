@@ -23,7 +23,6 @@ except ImportError:
 from core import (
     _preprocess,
     ocr_full_widget, ocr_pet_widget, ocr_enemy_widget,
-    enemy_bar_empty,
     MonitorConfig,
 )
 
@@ -35,19 +34,13 @@ from core import (
 @dataclass
 class _WidgetOCRState:
     player_ratios: list[float] = field(default_factory=lambda: [1.0, 1.0, 1.0])
+    player_ts:    float          = 0.0   # timestamp of last successful player OCR
     pet_ratios:    list[float] = field(default_factory=lambda: [1.0, 1.0])
+    pet_ts:       float          = 0.0   # timestamp of last successful pet OCR
     enemy_has:    bool           = False
     enemy_hp:     float | None   = None
     enemy_hp_str: str | None     = None
     enemy_ts:     float          = 0.0   # timestamp of last successful enemy OCR
-    # pixel-check cache (from enemy_bar_empty — replaces main-loop mss grab)
-    bar_is_empty: bool           = True
-    bar_red:      float          = 0.0
-    bar_pixel_ts: float          = 0.0
-    # raw shots for preview (None until first capture)
-    last_e_shot:  object         = None  # np.ndarray | None
-    last_p_shot:  object         = None  # np.ndarray | None
-    last_pt_shot: object         = None  # np.ndarray | None
 
 
 class EventWatcher:
@@ -136,7 +129,7 @@ class EventWatcher:
                 return {"left": rx, "top": ry, "width": rw, "height": rh}
         # Fallback: primary monitor centre
         with mss.mss() as sct:
-            mon = sct.monitors[1]
+            mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
         sw, sh = mon["width"], mon["height"]
         w, h = int(sw * 0.20), int(sh * 0.20)
         x = mon["left"] + (sw - w) // 2
@@ -282,9 +275,19 @@ class WidgetOCRWorker:
         with self._lock:
             return list(self._state.player_ratios)
 
+    def get_player_with_ts(self) -> tuple[list[float], float]:
+        """Atomically return (player_ratios, timestamp)."""
+        with self._lock:
+            return list(self._state.player_ratios), self._state.player_ts
+
     def get_pet(self) -> list[float]:
         with self._lock:
             return list(self._state.pet_ratios)
+
+    def get_pet_with_ts(self) -> tuple[list[float], float]:
+        """Atomically return (pet_ratios, timestamp)."""
+        with self._lock:
+            return list(self._state.pet_ratios), self._state.pet_ts
 
     def get_enemy(self) -> tuple[bool, float | None, str | None]:
         with self._lock:
@@ -294,15 +297,17 @@ class WidgetOCRWorker:
         with self._lock:
             return self._state.enemy_ts
 
-    def get_enemy_bar_pixel(self) -> tuple[bool, float, float]:
-        """Returns (is_empty, bar_red, timestamp) from the cached pixel check."""
+    def get_enemy_with_ts(self) -> tuple[bool, float | None, str | None, float]:
+        """Atomically return (has_enemy, hp, hp_str, timestamp)."""
         with self._lock:
-            return self._state.bar_is_empty, self._state.bar_red, self._state.bar_pixel_ts
+            return self._state.enemy_has, self._state.enemy_hp, self._state.enemy_hp_str, self._state.enemy_ts
 
-    def get_last_shots(self) -> tuple:
-        """Returns (e_shot, p_shot, pt_shot) — any may be None before first capture."""
+    def clear_enemy(self) -> None:
+        """Reset cached enemy data (call when target is confirmed dead/lost)."""
         with self._lock:
-            return self._state.last_e_shot, self._state.last_p_shot, self._state.last_pt_shot
+            self._state.enemy_has = False
+            self._state.enemy_hp = None
+            self._state.enemy_hp_str = None
 
     # ------------------------------------------------------------------
     # Internal
@@ -327,18 +332,11 @@ class WidgetOCRWorker:
 
         now = time.time()
         next_p, next_pt, next_e = now, now + 0.30, now   # stagger player vs pet by 0.3s
+        _pet_pending_count = 0  # consecutive readings awaiting jump confirmation
 
-        sct = mss.mss()
-        _mss_iter = 0
-        _MSS_RECREATE = 500
-        try:
+        with mss.mss() as sct:
             while not self._stop.is_set():
                 now = time.time()
-                _mss_iter += 1
-                if _mss_iter >= _MSS_RECREATE:
-                    _mss_iter = 0
-                    sct.close()
-                    sct = mss.mss()
 
                 with self._origin_lock:
                     new_ox, new_oy = self._ox, self._oy
@@ -351,18 +349,16 @@ class WidgetOCRWorker:
                     try:
                         shot = np.array(sct.grab(e_mon))[:, :, :3]
                         has_e, hp, hp_str = ocr_enemy_widget(shot)
-                        _is_empty, _bar_red = enemy_bar_empty(shot, self._cfg)
                         with self._lock:
-                            self._state.enemy_has    = has_e
+                            self._state.enemy_has = has_e
                             if has_e:
                                 self._state.enemy_hp     = hp
                                 self._state.enemy_hp_str = hp_str
                                 if hp is not None:
                                     self._state.enemy_ts = now
-                            self._state.bar_is_empty = _is_empty
-                            self._state.bar_red      = _bar_red
-                            self._state.bar_pixel_ts = now
-                            self._state.last_e_shot  = shot
+                            else:
+                                self._state.enemy_hp     = None
+                                self._state.enemy_hp_str = None
                     except Exception as exc:
                         print(f"[WidgetOCRWorker] Enemy error: {exc}")
 
@@ -371,10 +367,10 @@ class WidgetOCRWorker:
                     try:
                         shot = np.array(sct.grab(p_mon))[:, :, :3]
                         ratios = ocr_full_widget(shot)
-                        with self._lock:
-                            self._state.last_p_shot = shot
-                            if len(ratios) >= 3:
+                        if len(ratios) >= 3:
+                            with self._lock:
                                 self._state.player_ratios = ratios[:3]
+                                self._state.player_ts = now
                     except Exception as exc:
                         print(f"[WidgetOCRWorker] Player error: {exc}")
 
@@ -383,16 +379,29 @@ class WidgetOCRWorker:
                     try:
                         shot = np.array(sct.grab(pt_mon))[:, :, :3]
                         ratios = ocr_pet_widget(shot)
-                        with self._lock:
-                            self._state.last_pt_shot = shot
-                            if len(ratios) >= 2:
-                                self._state.pet_ratios = ratios[:2]
+                        if len(ratios) >= 2:
+                            # Jump filter: if HP changes >30% in one reading, require confirmation
+                            _new_hp = ratios[0]
+                            _old_hp = self._state.pet_ratios[0]
+                            _accept = True
+                            if abs(_new_hp - _old_hp) > 0.30 and _old_hp > 0:
+                                _pet_pending_count += 1
+                                if _pet_pending_count < 2:
+                                    print(f"[WidgetOCRWorker] Pet HP jump {_old_hp:.0%}->{_new_hp:.0%}, waiting for confirmation ({_pet_pending_count}/2)")
+                                    _accept = False
+                            if _accept:
+                                _pet_pending_count = 0
+                                with self._lock:
+                                    self._state.pet_ratios = ratios[:2]
+                                    self._state.pet_ts = now
+                            else:
+                                # Still update timestamp so main loop knows worker is alive
+                                with self._lock:
+                                    self._state.pet_ts = now
                     except Exception as exc:
                         print(f"[WidgetOCRWorker] Pet error: {exc}")
 
                 sleep_for = max(0.0, min(next_e, next_p, next_pt) - time.time())
                 self._stop.wait(sleep_for)
-        finally:
-            sct.close()
 
         print("[WidgetOCRWorker] Loop exited.")
