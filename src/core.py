@@ -354,10 +354,11 @@ def send_pico_command(cfg: MonitorConfig, cmd: str) -> None:
                 _pico_fail_until = 0.0
             except Exception as e:
                 print(f"\n[WIFI] Send error: {e}")
-                try:
-                    _wifi_sock.close()
-                except Exception:
-                    pass
+                if _wifi_sock is not None:
+                    try:
+                        _wifi_sock.close()
+                    except Exception:
+                        pass
                 _wifi_sock = None
                 _pico_fail_until = now + _PICO_BACKOFF_SEC
                 _pico_fail_logged = now
